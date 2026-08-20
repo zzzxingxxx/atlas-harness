@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "atlas-harness"
+version = "0.1.0"
+description = "A recoverable, governable and evolvable Agent Runtime."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "AtlasHarness Contributors" }]
+dependencies = [
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.2,<3",
+  "typer>=0.16,<1",
+]
+
+[project.scripts]
+atlas = "atlas_harness.transport.cli:main"
+
+[dependency-groups]
+dev = [
+  "hypothesis>=6.100,<7",
+  "mypy>=1.13,<2",
+  "pre-commit>=3.7,<5",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<1",
+  "ruff>=0.8,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/atlas_harness"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+warn_unused_configs = true
+
+[tool.uv]
+default-groups = ["dev"]
