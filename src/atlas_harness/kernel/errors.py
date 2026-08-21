@@ -71,3 +71,44 @@ class EventLogCorruptionError(EventStoreError):
 class SessionNotFoundError(AtlasError):
     code = "session_not_found"
     exit_code = 9
+
+
+class PolicyDeniedError(AtlasError):
+    """A policy refused an action before it could produce any side effect.
+
+    ``details`` carries the rule that refused so an operator can widen exactly
+    that rule instead of disabling the whole boundary.
+    """
+
+    code = "policy_denied"
+    exit_code = 10
+
+
+class ApprovalDeniedError(AtlasError):
+    code = "approval_denied"
+    exit_code = 11
+
+
+class ToolError(AtlasError):
+    code = "tool_error"
+    exit_code = 12
+
+
+class ToolNotFoundError(ToolError):
+    code = "tool_not_found"
+    exit_code = 13
+
+
+class ToolInputError(ToolError):
+    code = "tool_input_error"
+    exit_code = 14
+
+
+class ToolTimeoutError(ToolError):
+    code = "tool_timeout"
+    exit_code = 15
+
+
+class ToolVersionError(ToolError):
+    code = "tool_version_mismatch"
+    exit_code = 16

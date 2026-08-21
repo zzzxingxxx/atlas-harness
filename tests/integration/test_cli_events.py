@@ -129,3 +129,34 @@ def test_invalid_session_id_exits_with_a_validation_error(
 
     assert excinfo.value.code == 5
     assert json.loads(capsys.readouterr().err)["error"] == "event_validation_error"
+
+
+def test_tool_check_redacts_the_diff_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATLAS_WORKSPACE_ROOT", str(tmp_path))
+    args = json.dumps({"path": "secret.txt", "content": "api_key=sk-abcdefghijklmnop123456"})
+
+    result = runner.invoke(app, ["tool-check", "write_file", "--args", args, "--json"])
+
+    assert result.exit_code == 0
+    assert "sk-abcdefghijklmnop123456" not in result.stdout
+    assert "[redacted]" in json.loads(result.stdout)["preview"]
+
+
+def test_approval_mode_never_cannot_be_overridden_by_yes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ATLAS_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("ATLAS_DATA_DIR", str(tmp_path / "runtime"))
+    monkeypatch.setenv("ATLAS_APPROVAL_MODE", "never")
+    args = json.dumps({"path": "blocked.txt", "content": "blocked"})
+
+    result = runner.invoke(
+        app,
+        ["tool-run", "write_file", "--args", args, "--yes", "--json"],
+    )
+
+    assert result.exit_code == 11
+    assert json.loads(result.stdout)["error_code"] == "approval_denied"
+    assert not (tmp_path / "blocked.txt").exists()

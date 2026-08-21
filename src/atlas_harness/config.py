@@ -1,6 +1,7 @@
 """Application configuration loaded from environment variables."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +24,9 @@ class Settings(BaseSettings):
     model_timeout_seconds: float = Field(default=120.0, gt=0)
     operation_timeout_seconds: float = Field(default=1800.0, gt=0)
     max_tool_output_bytes: int = Field(default=131_072, gt=0)
+    max_read_bytes: int = Field(default=1_048_576, gt=0)
+    approval_mode: Literal["auto", "on_request", "always", "never"] = "on_request"
+    allow_network: bool = False
 
     def resolved_workspace_root(self) -> Path:
         """Return an absolute, normalized workspace root."""

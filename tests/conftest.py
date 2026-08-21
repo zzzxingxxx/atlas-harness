@@ -13,9 +13,19 @@ import pytest
 
 from atlas_harness.events import Event, EventBus, EventStore, EventType
 from atlas_harness.kernel import FaultInjector, FrozenClock
+from atlas_harness.policy import (
+    ApprovalGate,
+    FixedApprovalGate,
+    NetworkPolicy,
+    PathPolicy,
+    PolicyEngine,
+)
+from atlas_harness.tools import ToolRegistry, default_registry
+from atlas_harness.tools.executor import ToolExecutor
 
 DEMO_SESSION_ID = "ses_demo"
 DEMO_OPERATION_ID = "op_demo"
+TOOL_SESSION_ID = "ses_tools"
 
 StoreFactory = Callable[..., EventStore]
 
@@ -124,3 +134,70 @@ def seed() -> Callable[..., list[Event]]:
 def seeded(store: EventStore) -> tuple[EventStore, str]:
     seed_session(store)
     return store, DEMO_SESSION_ID
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> Path:
+    """A workspace root that is a sibling of the event log, never its parent."""
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def paths(workspace: Path) -> PathPolicy:
+    return PathPolicy(workspace, max_read_bytes=64_000)
+
+
+@pytest.fixture
+def policy(paths: PathPolicy, clock: FrozenClock) -> PolicyEngine:
+    return PolicyEngine(paths=paths, network=NetworkPolicy(clock=clock))
+
+
+ExecutorFactory = Callable[..., ToolExecutor]
+
+
+@pytest.fixture
+def tool_store(store_factory: StoreFactory, workspace: Path) -> EventStore:
+    """An event store with the tool session already created."""
+
+    store = store_factory()
+    store.append_new(
+        EventType.SESSION_CREATED,
+        session_id=TOOL_SESSION_ID,
+        payload={"title": "tools", "workspace_root": str(workspace)},
+    )
+    return store
+
+
+@pytest.fixture
+def executor_factory(
+    tool_store: EventStore,
+    policy: PolicyEngine,
+    clock: FrozenClock,
+    faults: FaultInjector,
+) -> ExecutorFactory:
+    def build(
+        *,
+        approve: bool = True,
+        registry: ToolRegistry | None = None,
+        approvals: ApprovalGate | None = None,
+        max_output_bytes: int = 131_072,
+    ) -> ToolExecutor:
+        return ToolExecutor(
+            registry=registry if registry is not None else default_registry(),
+            policy=policy,
+            store=tool_store,
+            approvals=approvals or FixedApprovalGate(approve, reason="test", approver="test"),
+            clock=clock,
+            faults=faults,
+            max_output_bytes=max_output_bytes,
+        )
+
+    return build
+
+
+@pytest.fixture
+def executor(executor_factory: ExecutorFactory) -> ToolExecutor:
+    return executor_factory()
