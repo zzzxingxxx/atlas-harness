@@ -112,6 +112,14 @@ class OperationState(BaseModel):
     """Calls a human still owes a decision on. Empty unless status is suspended."""
 
     resume_count: int = 0
+    compact_pending: bool = False
+    """The soft threshold was crossed and no compaction has run since."""
+
+    compaction_count: int = 0
+    last_compaction_reason: str | None = None
+    artifact_ids: list[str] = Field(default_factory=list)
+    """Large outputs moved out of the context. The bytes are still on disk, so a
+    compaction never costs evidence."""
 
     @property
     def open_tool_call_ids(self) -> list[str]:
@@ -167,6 +175,13 @@ class SessionState(BaseModel):
     snapshots: list[str] = Field(default_factory=list)
     snapshot_records: list[SnapshotState] = Field(default_factory=list)
     current_lane_id: str = DEFAULT_LANE
+    artifacts: list[str] = Field(default_factory=list)
+    """Every artifact stored in this session, in order. Ids only: the bytes live
+    on disk and are never folded into the projection."""
+
+    compactions: int = 0
+    """How many times the context was compacted. The messages above are unaffected
+    -- compaction replaces the prompt, not the record."""
 
     @property
     def pending_approval_ids(self) -> list[str]:
@@ -344,6 +359,13 @@ class Reducer:
             state.approvals.setdefault(str(payload["approval_id"]), None)
         elif event.event_type is EventType.APPROVAL_RESOLVED:
             state.approvals[str(payload["approval_id"])] = bool(payload["approved"])
+        elif event.event_type is EventType.ARTIFACT_STORED:
+            # Tracked at session level too: an artifact can be stored outside any
+            # operation, and either way the id has to stay findable after the
+            # prompt that referenced it has been compacted away.
+            state.artifacts.append(str(payload["artifact_id"]))
+        elif event.event_type is EventType.CONTEXT_COMPACTED:
+            state.compactions += 1
 
     def _apply_operation_event(
         self, operation: OperationState, event: Event, payload: dict[str, Any]
@@ -445,6 +467,18 @@ class Reducer:
             queued.consumed = True
             queued.consumed_at_ms = event.timestamp_ms
             operation.queue_messages[message_id] = queued
+        elif event_type is EventType.CONTEXT_COMPACT_PENDING:
+            operation.compact_pending = True
+        elif event_type is EventType.CONTEXT_COMPACTED:
+            # Compaction changes the prompt, not the record: the messages folded
+            # above stay exactly where they are. Only the counter moves, so a
+            # replay can tell how often this operation was compacted without the
+            # projection pretending anything was removed.
+            operation.compact_pending = False
+            operation.compaction_count += 1
+            operation.last_compaction_reason = str(payload.get("reason") or "threshold")
+        elif event_type is EventType.ARTIFACT_STORED:
+            operation.artifact_ids.append(str(payload["artifact_id"]))
 
     def reduce(self, events: Iterable[Event]) -> SessionState:
         for event in events:

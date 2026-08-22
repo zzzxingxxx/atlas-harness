@@ -540,6 +540,48 @@ def run(
 
 
 @app.command()
+def compact(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session to compact."),
+    operation_id: str | None = typer.Option(
+        None, "--operation", help="Compact one operation instead of the latest."
+    ),
+    objective: str = typer.Option(
+        "", "--objective", help="Override the objective recorded in the summary."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Compact a session's context, keeping the events and artifacts intact.
+
+    Nothing is deleted. The structured summary is recorded as an event, and the
+    original history stays exactly where it was -- compaction replaces what the
+    model reads, not what the log holds.
+    """
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        try:
+            summary = service.compact(session_id, operation_id=operation_id, objective=objective)
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+        state = store.load_state(session_id)
+    payload = {
+        "session_id": session_id,
+        "compactions": state.compactions,
+        "last_seq": state.last_seq,
+        "summary": summary.model_dump(mode="json"),
+    }
+    lines = [
+        f"compacted {session_id} (compaction #{state.compactions})",
+        "",
+        summary.as_text(),
+    ]
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command()
 def messages(
     ctx: typer.Context,
     session_id: str = typer.Argument(..., help="Session to queue a message for."),

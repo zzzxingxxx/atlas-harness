@@ -2,7 +2,7 @@
 
 AtlasHarness 是一个模型无关、工具可插拔、会话可恢复、能力可演化的 Agent Runtime。
 
-当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop，以及 M4 Session / Lane / 快照与崩溃恢复：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、四个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，以及周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M5-M9 里程碑逐步加入。
+当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复，以及 M5 上下文编译器与结构化压缩：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M6-M9 里程碑逐步加入。
 
 ## 环境
 
@@ -34,7 +34,7 @@ atlas doctor [--json]
 atlas sessions [--json]                 # 列出数据目录中的会话
 atlas inspect <session-id> [--json]     # 回放并打印会话摘要
 atlas replay <session-id> [--json]      # 从事件日志重建完整状态
-atlas tools [--json]                   # 列出四个内置工具及其权限
+atlas tools [--json]                   # 列出五个内置工具及其权限
 atlas tool-check <tool> --args '{}'     # 只做参数和策略预检
 atlas tool-run <tool> --args '{}' [--yes] [--json]
 atlas run "<prompt>" [--session <id>] [--provider fake] [--model <name>] \
@@ -45,6 +45,7 @@ atlas recover <session-id> [--json]     # 只查看恢复计划，不写入任�
 atlas resume <session-id> [--confirm <tool-call-id>]... [--json]
 atlas abort <session-id> [--reason <text>] [--json]
 atlas lanes <session-id> [--json]       # 列出 Lane 及各自的分支来源
+atlas compact <session-id> [--operation <id>] [--objective <text>] [--json]
 ```
 
 所有命令失败时输出结构化错误（`{"error", "message", "details"}`）并使用固定退出码：配置 2、生命周期 3、预算 4、事件校验 5、事件存储 6、恢复 7、日志损坏 8、会话不存在 9、策略拒绝 10、审批拒绝 11、工具错误 12-16、取消 130。
@@ -166,5 +167,74 @@ Lane 是一个会话内部的一条工作线。Lane 之间共享会话的只读�
 ### 恢复测试
 
 `tests/integration/test_crash_recovery.py` 在计划点出的每一个边界两侧都注入故障——模型请求、助手消息、工具开始、工具结果、快照创建、操作结束——每次都断言日志本身仍然完整、投影与日志一致、工具恰好执行了一次。Loop、执行器和 EventStore 共享同一个 `FaultInjector`，所以一次测试覆盖的是一条连续的时间线，不是三条互不相干的。
+
+## 上下文编译器与结构化压缩（M5）
+
+`schema_version` 升到 4，新增 `context_compact_pending`、`context_compacted`、`artifact_stored`。读取端仍然接受版本 1、2、3。
+
+M5 的全部安全论证都建立在一句不对称上：**压缩替换的是模型读到的内容，不是日志持有的内容。** 上下文是日志的缓存，压缩重建缓存；事件日志一条都不少。`test_compacting_does_not_remove_any_event` 用 `atlas replay` 从日志重建状态来检查这一点——如果压缩真删了什么，回放里就会缺东西。
+
+### 五个固定槽位
+
+编译顺序即优先级，裁剪顺序是它的逆序：
+
+| 槽位 | 内容 | 裁剪 |
+| --- | --- | --- |
+| `fixed` | 系统提示、身份、硬约束 | 钉死，永不裁剪 |
+| `task` | 当前目标、计划、压缩摘要 | 最后 |
+| `capability` | 工具声明与权限 | 第四 |
+| `short_term` | 最近若干轮对话 | 第二 |
+| `evidence` | 工具输出、检索结果、artifact 引用 | 最先 |
+
+`fixed` 不允许被工具结果覆盖，所以预算再紧也不会出现一个没有指令的 prompt；预算连钉死的槽位都装不下时 `_trim` 抛 `BudgetExceededError`——拒绝比发出一个没有系统提示的请求好。
+
+编译里有两种互不相同的排序，混淆它们是一个值得点名的 bug：**相关性**决定预算紧张时谁活下来（`_rank`），**插入顺序**决定活下来的内容出现在 prompt 的哪里（`_reading_order`）。只用相关性排序会把对话记录倒过来交给模型。
+
+### Token 计数与阈值
+
+`TokenCounter` 是一个 Protocol：先用 `EstimatingCounter` 估算，Provider 提供精确接口时换成 `AdapterCounter`。计数端点失败时回落到估算值——一个统计接口挂了不该让运行停下来。
+
+`ContextBudget` 把上限映射到三条线：
+
+- **70%** `prepare`：只写一条 `context_compact_pending`，不丢任何东西。越过 70% 是信息，还不是理由。
+- **85%** `compact`：自动压缩，理由记为 `threshold`。
+- **95%** `force`：强制压缩，理由记为 `overflow`。
+
+三个理由（`manual`/`threshold`/`overflow`）是一个封闭集合，未知理由直接拒绝，这样审计可以按它分组。
+
+### 结构化摘要的九个字段
+
+摘要不问模型，而是从日志折叠出来——`Compactor.summarize()` 读该操作下的事件，得到 `current_objective`、`task_progress`、`blockers`、`next_actions`、`decisions`、`tool_lessons`、`failed_paths`、`evidence_refs`、`open_questions`。九个字段永远都在，即使为空：消费方不该需要区分「没找到」和「键被丢了」。
+
+- 成功的工具调用进 `task_progress`，失败的进 `tool_lessons` 和 `failed_paths`——模型的下一步取决于知道什么没成。
+- M4 的挂起状态进 `blockers` 和 `open_questions`，所以压缩不会让模型忘记运行为什么停了。
+- 未消费的队列消息进 `next_actions`，欠着的指令不会因为压缩而消失。
+- 上一次压缩进 `decisions`，长任务不会丢掉第一次压缩确立的东西。
+- 摘要会重新进入 prompt，所以和其他内容一样脱敏。
+
+摘要每项都有条数和长度上限，超出时保留最近的：一个无界增长的摘要否定了它自己的目的。
+
+### 重建 prompt
+
+`_rebuild()` 保留系统消息 + 摘要 + 最近 N 轮。`_safe_split()` 会把切分点往前挪，越过任何一条其助手调用会被切掉的 `tool` 消息——一条没有对应请求的工具结果在若干 Provider 上是非法的。
+
+已经到底的对话记录（比如第 1 轮只有 `[system, user]`）没有可替换的内容：自动触发时 `require_replacement=True` 让它什么都不记录，否则压力一直高就会每轮写一条空压缩事件；手工触发仍然记录，因为运营者问了，答案就该进记录。
+
+### 大输出外置为 artifact
+
+超过 `max_artifact_inline_bytes`（默认 4096，按编码后字节数算）的工具输出写成 artifact 文件，prompt 里只留 `artifact_id`、大小和一段预览。文件先写、`artifact_stored` 事件后写，和快照同一个顺序。写盘前脱敏——artifact 文件和日志一样持久，里面的密钥会活过它下游的每一道过滤器。
+
+artifact 是**额外**一份拷贝：事件日志无论如何都保留着输出，所以这里不会是那些字节唯一存在的地方。
+
+### 三个触发点
+
+```bash
+uv run atlas compact <session-id>                      # 运营者手工标记，理由 manual
+uv run atlas compact <session-id> --objective "ship M5"
+```
+
+模型侧有 `compact_context` 工具，但这个工具本身不做压缩：它只记录意图，重写由 Loop 完成——一个能重写自己 prompt 的模型也能把 `fixed` 槽位丢掉。自动压缩在每轮迭代 drain 队列之后测量，所以一条把 prompt 顶过线的 steer 消息会算在它到达的那一轮里。
+
+`tests/integration/test_compaction_loop.py` 验证计划的完成条件：一个固定长任务经过至少一次自动压缩后仍然继续执行并完成。
 
 后续工具沙箱和能力演化功能以项目方案及开发计划为准。

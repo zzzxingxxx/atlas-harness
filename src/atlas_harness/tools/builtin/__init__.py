@@ -1,5 +1,9 @@
-"""The four builtin tools every runtime starts with."""
+"""The builtin tools every runtime starts with."""
 
+from atlas_harness.tools.builtin.compact_context import (
+    CompactContextInput,
+    CompactContextTool,
+)
 from atlas_harness.tools.builtin.read_file import ReadFileInput, ReadFileTool
 from atlas_harness.tools.builtin.run_command import RunCommandInput, RunCommandTool
 from atlas_harness.tools.builtin.search import SearchInput, SearchTool
@@ -8,10 +12,18 @@ from atlas_harness.tools.manifest import Tool
 
 
 def builtin_tools() -> tuple[Tool, ...]:
-    return (ReadFileTool(), RunCommandTool(), SearchTool(), WriteFileTool())
+    return (
+        CompactContextTool(),
+        ReadFileTool(),
+        RunCommandTool(),
+        SearchTool(),
+        WriteFileTool(),
+    )
 
 
 __all__ = [
+    "CompactContextInput",
+    "CompactContextTool",
     "ReadFileInput",
     "ReadFileTool",
     "RunCommandInput",

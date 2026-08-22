@@ -98,10 +98,16 @@ def test_describe_and_required_scopes_span_every_tool() -> None:
     assert registry.required_scopes() == {SCOPE_FS_READ}
 
 
-def test_default_registry_holds_the_four_builtin_tools() -> None:
+def test_default_registry_holds_the_builtin_tools() -> None:
     registry = default_registry()
 
-    assert registry.names() == ["read_file", "run_command", "search", "write_file"]
+    assert registry.names() == [
+        "compact_context",
+        "read_file",
+        "run_command",
+        "search",
+        "write_file",
+    ]
     assert registry.required_scopes() == {SCOPE_FS_READ, SCOPE_FS_WRITE, SCOPE_PROCESS}
     assert all(manifest.description for manifest in registry.manifests())
     assert all(manifest.input_schema["type"] == "object" for manifest in registry.manifests())

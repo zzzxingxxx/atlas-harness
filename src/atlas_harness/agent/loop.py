@@ -33,6 +33,19 @@ from atlas_harness.agent.state import (
     StopCause,
     steer_messages,
 )
+from atlas_harness.context.artifacts import ArtifactStore
+from atlas_harness.context.compaction import (
+    REASON_MANUAL,
+    CompactionResult,
+    Compactor,
+    compaction_reason_for,
+)
+from atlas_harness.context.tokens import (
+    ContextBudget,
+    ContextPressure,
+    EstimatingCounter,
+    TokenCounter,
+)
 from atlas_harness.events import DEFAULT_LANE, EventStore, EventType
 from atlas_harness.kernel.faults import FaultInjector
 from atlas_harness.model.assembler import AssembledResponse, StreamAssembler
@@ -41,7 +54,9 @@ from atlas_harness.model.protocol import (
     ModelMessage,
     ModelRequest,
     ModelToolCall,
+    TokenInput,
 )
+from atlas_harness.tools.builtin.compact_context import COMPACT_TOOL_NAME
 from atlas_harness.tools.executor import ToolCall, ToolExecutor, ToolOutcome
 from atlas_harness.tools.redaction import redact, truncate_text
 from atlas_harness.tools.registry import ToolRegistry
@@ -54,7 +69,9 @@ FAULT_BEFORE_ASSISTANT_MESSAGE = "agent_loop.before_assistant_message"
 FAULT_AFTER_ASSISTANT_MESSAGE = "agent_loop.after_assistant_message"
 FAULT_BEFORE_OPERATION_FINISHED = "agent_loop.before_operation_finished"
 FAULT_AFTER_OPERATION_FINISHED = "agent_loop.after_operation_finished"
-"""Crash points either side of the three events the loop owns.
+FAULT_BEFORE_CONTEXT_COMPACTED = "agent_loop.before_context_compacted"
+FAULT_AFTER_CONTEXT_COMPACTED = "agent_loop.after_context_compacted"
+"""Crash points either side of the events the loop owns.
 
 The loop shares the store's injector, so arming a point here and a point in the
 executor exercises one continuous timeline rather than two unrelated ones.
@@ -139,6 +156,11 @@ class AgentLoop:
         lane_id: str = DEFAULT_LANE,
         max_output_tokens: int | None = None,
         temperature: float | None = None,
+        budget: ContextBudget | None = None,
+        compactor: Compactor | None = None,
+        counter: TokenCounter | None = None,
+        artifacts: ArtifactStore | None = None,
+        keep_recent_messages: int = 4,
     ) -> None:
         self.adapter = adapter
         self.registry = registry
@@ -152,6 +174,17 @@ class AgentLoop:
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
         self._declarations = tool_declarations(registry)
+        # The budget is derived from the model's own window, minus the room the
+        # reply needs, so the thresholds mean the same thing across providers with
+        # very different context sizes.
+        self.budget = budget or ContextBudget.for_model(
+            max_context_tokens=adapter.capabilities().max_context_tokens,
+            reserve_output_tokens=max_output_tokens or 0,
+        )
+        self.compactor = compactor or Compactor(store, budget=self.budget)
+        self.counter: TokenCounter = counter or EstimatingCounter()
+        self.artifacts = artifacts or ArtifactStore(store)
+        self.keep_recent_messages = keep_recent_messages
 
     @property
     def faults(self) -> FaultInjector:
@@ -210,6 +243,9 @@ class AgentLoop:
 
             state.iterations += 1
             self._drain(queue, state)
+            # Measured after the drain, so a steer message that pushes the prompt
+            # over the mark is accounted for in the same iteration it arrives.
+            self._maybe_compact(state)
             asked = await self._ask(state, cancel=cancel)
             if asked is None:  # cancelled mid-stream; the stop cause is set
                 break
@@ -224,12 +260,107 @@ class AgentLoop:
             if self._cancelled(cancel):
                 state.stop(StopCause.CANCELLED, error="run was cancelled", code="cancelled")
                 break
-            await self._run_tools(state, response)
+            requested_keep = await self._run_tools(state, response)
+            if requested_keep is not None:
+                # The model asked for this one, so it runs regardless of pressure.
+                # It happens here rather than inside the tool phase because every
+                # tool message has now been appended: compacting earlier could cut
+                # a call away from the result that answers it.
+                self.compact(state, reason=REASON_MANUAL, keep_recent=requested_keep)
 
         return self._finish(state)
 
     def _cancelled(self, cancel: asyncio.Event | None) -> bool:
         return cancel is not None and cancel.is_set()
+
+    # -------------------------------------------------------------- compaction
+
+    def _prompt_tokens(self, state: RunState) -> int:
+        """Size the prompt as the provider will see it, declarations included."""
+
+        return self.counter.count(TokenInput(messages=state.messages, tools=self._declarations))
+
+    def _maybe_compact(self, state: RunState) -> None:
+        """Announce or perform a compaction, depending on how full the window is.
+
+        The measurement is the *next prompt*, not the run's cumulative usage: the
+        context window holds one request, so summing every request in the run would
+        trigger a compaction on a conversation that comfortably fits.
+
+        At the preparation mark this only records ``context_compact_pending`` —
+        crossing 70% is information, not yet a reason to discard anything. From the
+        automatic mark upward it compacts and replaces the working transcript.
+        """
+
+        used = self._prompt_tokens(state)
+        state.prompt_tokens = used
+        pressure = self.budget.pressure(used)
+        if pressure is ContextPressure.OK:
+            return
+        if not pressure.should_compact:
+            if not state.compact_pending:
+                state.compact_pending = True
+                self.compactor.mark_pending(
+                    state.session_id,
+                    operation_id=state.operation_id,
+                    used_tokens=used,
+                    lane_id=self.lane_id,
+                    iteration=state.iterations,
+                )
+            return
+        self.compact(
+            state,
+            reason=compaction_reason_for(pressure),
+            used_tokens=used,
+            require_replacement=True,
+        )
+
+    def compact(
+        self,
+        state: RunState,
+        *,
+        reason: str = REASON_MANUAL,
+        used_tokens: int | None = None,
+        keep_recent: int | None = None,
+        require_replacement: bool = False,
+    ) -> CompactionResult:
+        """Compact now, whatever the pressure. Used by ``/compact`` and the tool.
+
+        The rewrite is applied to the working transcript only after the event is
+        recorded, so a crash between the two leaves a log that says a compaction
+        happened and a prompt that is merely longer than necessary — the safe
+        direction, since the transcript is rebuilt from the log on restart anyway.
+
+        ``require_replacement`` separates the two kinds of caller. An automatic
+        trigger passes it, because pressure stays high after a compaction that
+        freed nothing and an event per iteration would bury the log in compactions
+        that did no work. A manual trigger does not: someone asked, so "there was
+        nothing to compact" is an answer worth recording.
+        """
+
+        used = self._prompt_tokens(state) if used_tokens is None else used_tokens
+        self.faults.check(FAULT_BEFORE_CONTEXT_COMPACTED)
+        result = self.compactor.compact(
+            state.session_id,
+            operation_id=state.operation_id,
+            messages=state.messages,
+            used_tokens=used,
+            reason=reason,
+            keep_recent=self.keep_recent_messages if keep_recent is None else keep_recent,
+            lane_id=self.lane_id,
+            iteration=state.iterations,
+            require_replacement=require_replacement,
+        )
+        self.faults.check(FAULT_AFTER_CONTEXT_COMPACTED)
+        if result.replaced_messages:
+            state.replace_messages(result.messages)
+            state.prompt_tokens = self._prompt_tokens(state)
+        else:
+            # Nothing to replace: the transcript is already system messages plus
+            # the tail we were told to keep. Clearing the flag stops the pending
+            # announcement from being rewritten on every later iteration.
+            state.compact_pending = False
+        return result
 
     def _drain(self, queue: QueueManager, state: RunState) -> None:
         """Fold pending steer and follow-up messages into the transcript."""
@@ -356,11 +487,16 @@ class AgentLoop:
             )
             self.faults.check(FAULT_AFTER_ASSISTANT_MESSAGE)
 
-    async def _run_tools(self, state: RunState, response: AssembledResponse) -> None:
+    async def _run_tools(self, state: RunState, response: AssembledResponse) -> int | None:
         """Execute the requested calls and append one tool message per call.
 
         Every call the model made gets exactly one reply, in the order it asked,
         so the transcript stays valid for providers that require it.
+
+        Returns the ``keep_recent`` a successful ``compact_context`` call asked for,
+        or ``None``. The compaction itself happens back in :meth:`run`, after every
+        call has been answered: rewriting the transcript here would strand the tool
+        messages this method still has to append.
         """
 
         wanted = len(response.valid_tool_calls)
@@ -375,7 +511,7 @@ class AgentLoop:
                 response,
                 fallback="the tool call budget for this run is exhausted",
             )
-            return
+            return None
 
         runnable = [
             ToolCall(
@@ -410,7 +546,7 @@ class AgentLoop:
             content = (
                 json.dumps({"error": "tool_error", "message": "tool did not produce a result"})
                 if outcome is None
-                else _tool_result_content(outcome)
+                else self._result_content(state, outcome)
             )
             state.add(
                 ModelMessage.tool(
@@ -419,6 +555,52 @@ class AgentLoop:
                     name=call.name,
                 )
             )
+
+        return self._compaction_request(outcomes)
+
+    def _compaction_request(self, outcomes: dict[str, ToolOutcome]) -> int | None:
+        """Read a ``compact_context`` call's ``keep_recent`` out of the outcomes.
+
+        Only a *successful* call counts. A denied or failed one already told the
+        model why in its tool message, and acting on it anyway would let a refused
+        call still rewrite the prompt.
+        """
+
+        for outcome in outcomes.values():
+            if outcome.tool_name != COMPACT_TOOL_NAME or not outcome.success:
+                continue
+            output = outcome.output
+            if isinstance(output, dict):
+                requested = output.get("keep_recent")
+                if isinstance(requested, int) and requested > 0:
+                    return requested
+            return self.keep_recent_messages
+        return None
+
+    def _result_content(self, state: RunState, outcome: ToolOutcome) -> str:
+        """Render one result for the prompt, externalizing it when it is large.
+
+        A successful output over the inline limit is written to an artifact and the
+        model receives a preview plus the artifact id instead. Failures are never
+        externalized: an error message is small and is exactly what the model needs
+        in full to decide its next move.
+
+        The event log already holds the untruncated output, so the artifact is not
+        the only copy — it exists so the *prompt* can carry a reference rather than
+        a megabyte of build log.
+        """
+
+        if not outcome.success or not self.artifacts.should_externalize(outcome.output):
+            return _tool_result_content(outcome)
+        reference = self.artifacts.store(
+            outcome.output,
+            session_id=state.session_id,
+            operation_id=state.operation_id,
+            lane_id=self.lane_id,
+            tool_name=outcome.tool_name,
+            call_id=outcome.call_id,
+        )
+        return json.dumps(reference.as_context_value(), ensure_ascii=False, default=str)
 
     def _reply_all(self, state: RunState, response: AssembledResponse, *, fallback: str) -> None:
         """Answer every pending call with one refusal, keeping the pairing valid."""

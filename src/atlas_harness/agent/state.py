@@ -69,6 +69,9 @@ class RunResult(BaseModel):
     answer: str = ""
     iterations: int = 0
     tool_calls: int = 0
+    compactions: int = 0
+    """How many times the prompt was compacted. Zero for a run that never needed it."""
+
     usage: TokenUsage = Field(default_factory=TokenUsage)
     error: str | None = None
     error_code: str | None = None
@@ -86,6 +89,7 @@ class RunResult(BaseModel):
             "stop_cause": self.stop_cause.value,
             "iterations": self.iterations,
             "tool_calls": self.tool_calls,
+            "compactions": self.compactions,
             "answer_length": len(self.answer),
             "input_tokens": self.usage.input_tokens,
             "output_tokens": self.usage.output_tokens,
@@ -112,6 +116,17 @@ class RunState:
         self.iterations = 0
         self.tool_calls = 0
         self.usage = TokenUsage()
+        self.compactions = 0
+        self.compact_pending = False
+        """Set once the soft threshold is announced, cleared by a compaction, so
+        the pending event is written once per compaction cycle rather than on
+        every iteration above 70%."""
+
+        self.prompt_tokens = 0
+        """Size of the last prompt actually sent. Compaction decisions read this
+        rather than cumulative usage: the window holds one request, not the sum of
+        every request in the run."""
+
         self.stop_cause: StopCause | None = None
         self.error: str | None = None
         self.error_code: str | None = None
@@ -131,6 +146,21 @@ class RunState:
 
     def add_user(self, content: str) -> None:
         self._messages.append(ModelMessage.user(content))
+
+    def replace_messages(self, messages: Sequence[ModelMessage]) -> int:
+        """Swap the transcript for a compacted one, returning how many turns went.
+
+        Only the working set changes. Every message removed here is already in the
+        event log, so this is a cache eviction rather than a deletion -- which is
+        why the method is free to drop content the run still depends on knowing
+        *about*: the summary that replaces it carries the parts that matter.
+        """
+
+        removed = max(0, len(self._messages) - len(messages))
+        self._messages = list(messages)
+        self.compactions += 1
+        self.compact_pending = False
+        return removed
 
     def last_assistant_text(self) -> str:
         """The most recent non-empty assistant text, i.e. the answer so far."""
@@ -174,6 +204,7 @@ class RunState:
             answer=self.last_assistant_text() if answer is None else answer,
             iterations=self.iterations,
             tool_calls=self.tool_calls,
+            compactions=self.compactions,
             usage=self.usage,
             error=self.error,
             error_code=self.error_code,

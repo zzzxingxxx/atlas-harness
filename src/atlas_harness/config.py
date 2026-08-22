@@ -45,6 +45,25 @@ class Settings(BaseSettings):
     """Events between snapshots. Snapshots only shorten replay, so this is a
     performance knob: losing one costs time on recovery, never correctness."""
 
+    context_prepare_ratio: float = Field(default=0.70, gt=0, le=1)
+    context_compact_ratio: float = Field(default=0.85, gt=0, le=1)
+    context_force_ratio: float = Field(default=0.95, gt=0, le=1)
+    """The plan's three marks: prepare, compact automatically, force. Operator
+    configurable because a model with a small window may need to compact earlier."""
+
+    context_keep_recent_turns: int = Field(default=4, gt=0)
+    """Turns kept verbatim after a compaction. The model needs the thread it was
+    pulling on; everything older becomes the structured summary."""
+
+    max_artifact_inline_bytes: int = Field(default=4_096, gt=0)
+    """Tool outputs above this are stored as artifacts and referenced. Below it the
+    reference would cost more context than the content it replaces."""
+
+    auto_compact: bool = True
+    """Compact automatically at an iteration boundary. Turning this off makes a
+    long run fail on its token budget instead, which is occasionally what a test
+    wants and never what a user does."""
+
     def resolved_workspace_root(self) -> Path:
         """Return an absolute, normalized workspace root."""
 

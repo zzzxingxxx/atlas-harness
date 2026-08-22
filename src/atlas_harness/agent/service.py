@@ -19,9 +19,16 @@ from atlas_harness.agent.loop import AgentLoop
 from atlas_harness.agent.queues import QueueManager, QueueName, QueueRequest, QueueSnapshot
 from atlas_harness.agent.state import DEFAULT_SYSTEM_PROMPT, BudgetLimits, RunResult
 from atlas_harness.config import Settings
+from atlas_harness.context.artifacts import ArtifactStore
+from atlas_harness.context.compaction import REASON_MANUAL, CompactionSummary, Compactor
+from atlas_harness.context.tokens import ContextBudget
 from atlas_harness.events import DEFAULT_LANE, EventStore, EventType
 from atlas_harness.events.reducer import OperationState
-from atlas_harness.kernel.errors import RecoveryError, SessionNotFoundError
+from atlas_harness.kernel.errors import (
+    LifecycleError,
+    RecoveryError,
+    SessionNotFoundError,
+)
 from atlas_harness.model.catalog import build_adapter
 from atlas_harness.model.protocol import ModelAdapter
 from atlas_harness.policy.approval import ApprovalGate, FixedApprovalGate
@@ -133,6 +140,11 @@ class AgentService:
             max_output_tokens=min(
                 self.settings.model_max_output_tokens,
                 capabilities.max_output_tokens,
+            ),
+            budget=self.context_budget(),
+            keep_recent_messages=self.settings.context_keep_recent_turns,
+            artifacts=ArtifactStore(
+                self.store, inline_limit=self.settings.max_artifact_inline_bytes
             ),
         )
 
@@ -248,6 +260,66 @@ class AgentService:
         """Blocking entry point for the CLI."""
 
         return asyncio.run(self.run(prompt, **kwargs))
+
+    # ----------------------------------------------------------------- compaction
+
+    def compact(
+        self,
+        session_id: str,
+        *,
+        operation_id: str | None = None,
+        reason: str = REASON_MANUAL,
+        objective: str = "",
+    ) -> CompactionSummary:
+        """Compact a session from outside a run, and record that it happened.
+
+        There is no live transcript here, so nothing is replaced: the summary is
+        folded out of the log and written as a ``context_compacted`` event. That is
+        the useful half for an operator, who wants to see the objective, blockers
+        and evidence the session has accumulated and mark the point deliberately
+        rather than wait for a threshold to do it.
+        """
+
+        if not self.store.session_exists(session_id):
+            raise SessionNotFoundError(
+                "cannot compact an unknown session",
+                details={"session_id": session_id},
+            )
+        state = self.store.load_state(session_id)
+        target = operation_id or _latest_operation_id(state.operations)
+        if target is None:
+            raise LifecycleError(
+                "session has no operation to compact",
+                details={"session_id": session_id},
+            )
+        compactor = Compactor(self.store, budget=self.context_budget())
+        summary = compactor.summarize(
+            session_id, operation_id=target, objective=objective, state=state
+        )
+        compactor.compact(
+            session_id,
+            operation_id=target,
+            messages=(),
+            used_tokens=0,
+            reason=reason,
+            lane_id=state.operations[target].lane_id,
+        )
+        return summary
+
+    def context_budget(self) -> ContextBudget:
+        """The same budget the loop uses, so CLI and loop agree on the marks."""
+
+        capabilities = self.adapter.capabilities()
+        return ContextBudget.for_model(
+            max_context_tokens=capabilities.max_context_tokens,
+            reserve_output_tokens=min(
+                self.settings.model_max_output_tokens,
+                capabilities.max_output_tokens,
+            ),
+            prepare_ratio=self.settings.context_prepare_ratio,
+            compact_ratio=self.settings.context_compact_ratio,
+            force_ratio=self.settings.context_force_ratio,
+        )
 
 
 def _latest_operation_id(operations: Mapping[str, OperationState]) -> str | None:

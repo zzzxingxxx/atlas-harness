@@ -12,11 +12,11 @@ from atlas_harness.kernel.ids import IdFactory
 
 DEFAULT_LANE = "main"
 
-CURRENT_SCHEMA_VERSION = 3
-"""Version written by this build. M4 added the lane, branch and recovery events."""
+CURRENT_SCHEMA_VERSION = 4
+"""Version written by this build. M5 added the compaction and artifact events."""
 
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
-"""Versions this build can read. v1/v2 logs from M1-M3 stay replayable."""
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+"""Versions this build can read. v1-v3 logs from M1-M4 stay replayable."""
 
 
 class EventType(StrEnum):
@@ -41,6 +41,9 @@ class EventType(StrEnum):
     PROVIDER_ERROR = "provider_error"
     QUEUE_MESSAGE_ENQUEUED = "queue_message_enqueued"
     QUEUE_MESSAGE_CONSUMED = "queue_message_consumed"
+    CONTEXT_COMPACT_PENDING = "context_compact_pending"
+    CONTEXT_COMPACTED = "context_compacted"
+    ARTIFACT_STORED = "artifact_stored"
 
 
 TERMINAL_OPERATION_EVENTS = frozenset(
@@ -217,6 +220,70 @@ class QueueMessageConsumed(Payload):
     iteration: int | None = None
 
 
+COMPACTION_REASONS = frozenset({"manual", "threshold", "overflow"})
+"""Why a compaction ran. Recorded so an operator can tell a deliberate
+``/compact`` apart from one the token budget forced."""
+
+
+class ContextCompactPending(Payload):
+    """The soft threshold was crossed. Nothing has been compacted yet.
+
+    Written once per operation when usage first passes the preparation mark, so
+    the decision to compact is visible in the log before it happens rather than
+    only afterwards.
+    """
+
+    used_tokens: int = 0
+    limit_tokens: int = 0
+    ratio: float = 0.0
+    iteration: int | None = None
+
+
+class ContextCompacted(Payload):
+    """One structured compaction. Only the model's context is replaced.
+
+    The original events, diffs and artifacts stay in the log untouched: this
+    payload records the summary that took their place in the *prompt*, not a
+    deletion. Every field the plan requires is present even when empty, so a
+    consumer never has to guess whether a key was dropped or simply had nothing
+    in it.
+    """
+
+    reason: str = "threshold"
+    used_tokens: int = 0
+    limit_tokens: int = 0
+    ratio: float = 0.0
+    freed_tokens: int = 0
+    replaced_messages: int = 0
+    iteration: int | None = None
+    current_objective: str = ""
+    task_progress: list[str] = Field(default_factory=list)
+    blockers: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+    decisions: list[str] = Field(default_factory=list)
+    tool_lessons: list[str] = Field(default_factory=list)
+    failed_paths: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+
+
+class ArtifactStored(Payload):
+    """A large tool output moved to a file; the context keeps only this reference.
+
+    ``size`` is the artifact's own byte count, not the truncated preview's, so a
+    reader can tell how much was set aside.
+    """
+
+    artifact_id: str
+    kind: str = "tool_output"
+    path: str | None = None
+    checksum: str | None = None
+    size: int = 0
+    tool_name: str | None = None
+    call_id: str | None = None
+    preview: str | None = None
+
+
 PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.SESSION_CREATED: SessionCreated,
     EventType.OPERATION_STARTED: OperationStarted,
@@ -239,6 +306,9 @@ PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.PROVIDER_ERROR: ProviderError,
     EventType.QUEUE_MESSAGE_ENQUEUED: QueueMessageEnqueued,
     EventType.QUEUE_MESSAGE_CONSUMED: QueueMessageConsumed,
+    EventType.CONTEXT_COMPACT_PENDING: ContextCompactPending,
+    EventType.CONTEXT_COMPACTED: ContextCompacted,
+    EventType.ARTIFACT_STORED: ArtifactStored,
 }
 
 
