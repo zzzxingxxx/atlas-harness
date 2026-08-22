@@ -12,11 +12,11 @@ from atlas_harness.kernel.ids import IdFactory
 
 DEFAULT_LANE = "main"
 
-CURRENT_SCHEMA_VERSION = 2
-"""Version written by this build. M3 added the model-stream and queue events."""
+CURRENT_SCHEMA_VERSION = 3
+"""Version written by this build. M4 added the lane, branch and recovery events."""
 
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
-"""Versions this build can read. v1 logs from M1/M2 stay replayable."""
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+"""Versions this build can read. v1/v2 logs from M1-M3 stay replayable."""
 
 
 class EventType(StrEnum):
@@ -31,7 +31,12 @@ class EventType(StrEnum):
     OPERATION_FINISHED = "operation_finished"
     OPERATION_FAILED = "operation_failed"
     OPERATION_ABORTED = "operation_aborted"
+    OPERATION_SUSPENDED = "operation_suspended"
+    OPERATION_RESUMED = "operation_resumed"
     SNAPSHOT_CREATED = "snapshot_created"
+    LANE_CREATED = "lane_created"
+    BRANCH_CREATED = "branch_created"
+    BRANCH_SWITCHED = "branch_switched"
     MODEL_STREAM_COMPLETED = "model_stream_completed"
     PROVIDER_ERROR = "provider_error"
     QUEUE_MESSAGE_ENQUEUED = "queue_message_enqueued"
@@ -45,6 +50,9 @@ TERMINAL_OPERATION_EVENTS = frozenset(
         EventType.OPERATION_ABORTED,
     }
 )
+
+SUSPENDED_STATUS = "suspended"
+"""Status an operation, lane and session take while a decision is owed."""
 
 
 class Payload(BaseModel):
@@ -89,6 +97,13 @@ class ToolStarted(Payload):
     tool_name: str
     call_id: str | None = None
     arguments: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+    risk: str | None = None
+    """Declared risk level, copied from the manifest so recovery can triage
+    an unfinished call without re-consulting the registry."""
+    idempotent: bool = False
+    """Whether the manifest declares the call safe to run twice. Recovery also
+    needs the risk level: an idempotent write still owes a confirmation."""
 
 
 class ToolResult(Payload):
@@ -112,9 +127,53 @@ class OperationAborted(Payload):
     reason: str | None = None
 
 
+class OperationSuspended(Payload):
+    """A decision is owed before the operation may continue."""
+
+    reason: str
+    pending_tool_call_ids: list[str] = Field(default_factory=list)
+    detail: str | None = None
+
+
+class OperationResumed(Payload):
+    """Recovery took the operation out of suspended."""
+
+    resumed_from_seq: int | None = None
+    confirmed_tool_call_ids: list[str] = Field(default_factory=list)
+    replayed_tool_call_ids: list[str] = Field(default_factory=list)
+
+
 class SnapshotCreated(Payload):
     snapshot_id: str | None = None
     state_hash: str | None = None
+    last_seq: int | None = None
+    """Last valid seq folded into this snapshot. Recovery replays from here."""
+    path: str | None = None
+    checksum: str | None = None
+    event_count: int | None = None
+
+
+class LaneCreated(Payload):
+    lane: str
+    parent_lane: str | None = None
+    reason: str | None = None
+
+
+class BranchCreated(Payload):
+    """A new lane forked off an existing one at a known seq."""
+
+    lane: str
+    parent_lane: str | None = None
+    from_seq: int | None = None
+    label: str | None = None
+
+
+class BranchSwitched(Payload):
+    """Navigation only. History is never rewritten or deleted."""
+
+    lane: str
+    from_lane: str | None = None
+    at_seq: int | None = None
 
 
 class ModelStreamCompleted(Payload):
@@ -170,7 +229,12 @@ PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.OPERATION_FINISHED: OperationFinished,
     EventType.OPERATION_FAILED: OperationFailed,
     EventType.OPERATION_ABORTED: OperationAborted,
+    EventType.OPERATION_SUSPENDED: OperationSuspended,
+    EventType.OPERATION_RESUMED: OperationResumed,
     EventType.SNAPSHOT_CREATED: SnapshotCreated,
+    EventType.LANE_CREATED: LaneCreated,
+    EventType.BRANCH_CREATED: BranchCreated,
+    EventType.BRANCH_SWITCHED: BranchSwitched,
     EventType.MODEL_STREAM_COMPLETED: ModelStreamCompleted,
     EventType.PROVIDER_ERROR: ProviderError,
     EventType.QUEUE_MESSAGE_ENQUEUED: QueueMessageEnqueued,

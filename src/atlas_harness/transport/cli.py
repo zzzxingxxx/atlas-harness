@@ -21,6 +21,7 @@ from atlas_harness.kernel.errors import (
     CancellationError,
     PolicyDeniedError,
     ProviderError,
+    RecoveryError,
     ToolError,
     ToolInputError,
     ToolNotFoundError,
@@ -30,6 +31,9 @@ from atlas_harness.kernel.errors import (
 from atlas_harness.observability.logging import configure_logging
 from atlas_harness.observability.trace import build_trace
 from atlas_harness.policy import ApprovalGate, ApprovalMode, FixedApprovalGate, PolicyEngine
+from atlas_harness.session.branches import BranchService
+from atlas_harness.session.recovery import RecoveryPlan
+from atlas_harness.session.service import SessionService
 from atlas_harness.tools import ToolContext, default_registry, redact, truncate_text
 from atlas_harness.tools.executor import ToolCall, ToolExecutor
 
@@ -188,6 +192,134 @@ def replay(
         f"last_seq: {state.last_seq}",
         f"state_hash: {payload['state_hash']}",
     ]
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+def _recovery_lines(plan: RecoveryPlan) -> list[str]:
+    lines = [
+        f"session: {plan.session_id}",
+        f"last_valid_seq: {plan.last_valid_seq}",
+        f"resumed_from_seq: {plan.resumed_from_seq}",
+        f"snapshot: {plan.snapshot_id or 'none'}",
+    ]
+    if not plan.operations:
+        lines.append("nothing unfinished")
+    for operation in plan.operations:
+        lines.append(f"operation {operation.operation_id} [{operation.status}]")
+        if operation.model_request_incomplete:
+            lines.append("  model request never returned a response")
+        for decision in operation.decisions:
+            lines.append(
+                f"  {decision.action:<7} {decision.call_id} ({decision.tool_name}): "
+                f"{decision.reason}"
+            )
+    lines.append(f"next: {plan.command()}")
+    return lines
+
+
+@app.command()
+def recover(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session id to examine."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Show what recovery would do without writing anything."""
+
+    with _store(ctx) as store:
+        service = SessionService(store)
+        try:
+            plan = service.recovery.plan(session_id)
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    _emit(plan.summary(), json_output=json_output, lines=_recovery_lines(plan))
+
+
+@app.command()
+def resume(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session id to resume."),
+    confirm: list[str] = typer.Option(
+        [],
+        "--confirm",
+        help="Tool call id a human authorizes to run again. Repeatable.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Resume a crashed session, replaying only what is provably safe.
+
+    A call that already recorded a ``tool_result`` is never re-executed. A call whose
+    side effect cannot be proven safe stays suspended until it is named by --confirm.
+    """
+
+    with _store(ctx) as store:
+        service = SessionService(store)
+        try:
+            plan = service.resume(session_id, confirm=confirm)
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    lines = _recovery_lines(plan)
+    _emit(plan.summary(), json_output=json_output, lines=lines)
+    if plan.needs_confirmation:
+        raise typer.Exit(code=RecoveryError.exit_code)
+
+
+@app.command()
+def abort(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session id to abort."),
+    reason: str = typer.Option("aborted by operator", "--reason", help="Recorded with the event."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Close every unfinished operation in a session without running anything."""
+
+    with _store(ctx) as store:
+        service = SessionService(store)
+        try:
+            written = service.abort(session_id, reason=reason)
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+        state = store.load_state(session_id)
+    payload = {
+        "session_id": session_id,
+        "aborted_operations": [event.operation_id for event in written],
+        "reason": reason,
+        "status": state.status,
+        "last_seq": state.last_seq,
+    }
+    lines = [f"aborted {len(written)} operation(s) in {session_id}", f"status: {state.status}"]
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command()
+def lanes(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session id to list lanes for."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """List the lanes of a session and where each one branched from."""
+
+    with _store(ctx) as store:
+        service = BranchService(store)
+        try:
+            views = service.lanes(session_id)
+            current = service.current_lane(session_id)
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload = {
+        "session_id": session_id,
+        "current_lane": current,
+        "lanes": [view.model_dump(mode="json") for view in views],
+    }
+    lines = [
+        f"{'*' if view.lane_id == current else ' '} {view.lane_id}  [{view.status}] "
+        f"parent={view.parent_lane or '-'} from_seq={view.forked_from_seq or '-'} "
+        f"operations={len(view.operation_ids)}"
+        for view in views
+    ] or ["no lanes"]
     _emit(payload, json_output=json_output, lines=lines)
 
 

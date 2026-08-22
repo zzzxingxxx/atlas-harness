@@ -133,7 +133,7 @@ def test_unsupported_schema_version_is_refused_on_append(store: EventStore) -> N
     with pytest.raises(EventValidationError) as excinfo:
         store.append(event)
 
-    assert excinfo.value.details == {"schema_version": 99, "supported": [1, 2]}
+    assert excinfo.value.details == {"schema_version": 99, "supported": [1, 2, 3]}
     assert not store.session_exists("ses_a")
 
 

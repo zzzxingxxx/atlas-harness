@@ -34,6 +34,7 @@ from atlas_harness.agent.state import (
     steer_messages,
 )
 from atlas_harness.events import DEFAULT_LANE, EventStore, EventType
+from atlas_harness.kernel.faults import FaultInjector
 from atlas_harness.model.assembler import AssembledResponse, StreamAssembler
 from atlas_harness.model.protocol import (
     ModelAdapter,
@@ -46,6 +47,18 @@ from atlas_harness.tools.redaction import redact, truncate_text
 from atlas_harness.tools.registry import ToolRegistry
 
 LOGGER = logging.getLogger(__name__)
+
+FAULT_BEFORE_MODEL_REQUESTED = "agent_loop.before_model_requested"
+FAULT_AFTER_MODEL_REQUESTED = "agent_loop.after_model_requested"
+FAULT_BEFORE_ASSISTANT_MESSAGE = "agent_loop.before_assistant_message"
+FAULT_AFTER_ASSISTANT_MESSAGE = "agent_loop.after_assistant_message"
+FAULT_BEFORE_OPERATION_FINISHED = "agent_loop.before_operation_finished"
+FAULT_AFTER_OPERATION_FINISHED = "agent_loop.after_operation_finished"
+"""Crash points either side of the three events the loop owns.
+
+The loop shares the store's injector, so arming a point here and a point in the
+executor exercises one continuous timeline rather than two unrelated ones.
+"""
 
 MAX_TOOL_MESSAGE_CHARS = 16_384
 """A tool result re-enters the prompt, so it is capped independently of the log."""
@@ -139,6 +152,12 @@ class AgentLoop:
         self.max_output_tokens = max_output_tokens
         self.temperature = temperature
         self._declarations = tool_declarations(registry)
+
+    @property
+    def faults(self) -> FaultInjector:
+        """Shared with the store and the executor, so one timeline covers all three."""
+
+        return self.store.faults
 
     async def run(
         self,
@@ -242,6 +261,7 @@ class AgentLoop:
         """
 
         request = self._build_request(state)
+        self.faults.check(FAULT_BEFORE_MODEL_REQUESTED)
         self._append(
             EventType.MODEL_REQUESTED,
             state,
@@ -253,6 +273,7 @@ class AgentLoop:
                 **request.summary(),
             },
         )
+        self.faults.check(FAULT_AFTER_MODEL_REQUESTED)
         assembler = StreamAssembler()
         try:
             async for event in self.adapter.stream(request):
@@ -327,11 +348,13 @@ class AgentLoop:
             },
         )
         if response.text:
+            self.faults.check(FAULT_BEFORE_ASSISTANT_MESSAGE)
             self._append(
                 EventType.ASSISTANT_MESSAGE,
                 state,
                 {"content": redact(response.text), "role": "assistant"},
             )
+            self.faults.check(FAULT_AFTER_ASSISTANT_MESSAGE)
 
     async def _run_tools(self, state: RunState, response: AssembledResponse) -> None:
         """Execute the requested calls and append one tool message per call.
@@ -427,7 +450,9 @@ class AgentLoop:
                 {"reason": result.error or "run was cancelled"},
             )
         else:
+            self.faults.check(FAULT_BEFORE_OPERATION_FINISHED)
             self._append(EventType.OPERATION_FINISHED, state, {"result": result.summary()})
+            self.faults.check(FAULT_AFTER_OPERATION_FINISHED)
         return result
 
     def _append(self, event_type: EventType, state: RunState, payload: dict[str, Any]) -> None:

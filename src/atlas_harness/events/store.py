@@ -99,6 +99,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_event_id ON events (event_id);
 CREATE UNIQUE INDEX IF NOT EXISTS events_idempotency
     ON events (session_id, idempotency_key);
 CREATE INDEX IF NOT EXISTS events_lane_seq ON events (session_id, lane_id, seq);
+CREATE TABLE IF NOT EXISTS lanes (
+    session_id  TEXT NOT NULL,
+    lane        TEXT NOT NULL,
+    parent_lane TEXT,
+    status      TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (session_id, lane)
+);
+CREATE TABLE IF NOT EXISTS operations (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    lane        TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    started_at  INTEGER,
+    finished_at INTEGER,
+    deadline_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS operations_session_status
+    ON operations (session_id, status);
+CREATE TABLE IF NOT EXISTS tool_calls (
+    tool_call_id    TEXT PRIMARY KEY,
+    session_id      TEXT NOT NULL,
+    operation_id    TEXT NOT NULL,
+    tool_name       TEXT NOT NULL,
+    idempotency_key TEXT,
+    risk            TEXT,
+    idempotent      INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS tool_calls_idempotency
+    ON tool_calls (operation_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS tool_calls_operation ON tool_calls (operation_id, status);
+CREATE TABLE IF NOT EXISTS snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL,
+    lane        TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    path        TEXT,
+    checksum    TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS snapshots_lane_seq
+    ON snapshots (session_id, lane, seq);
 """
 
 _INSERT_EVENT = """
@@ -143,6 +188,16 @@ class SqliteEventIndex:
 
     def close(self) -> None:
         self._connection.close()
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        """Shared handle. The session repository projects its tables in here too.
+
+        One connection means one close path, which matters on Windows where an open
+        SQLite handle blocks the data directory from being removed.
+        """
+
+        return self._connection
 
     def indexed_event_ids(self, session_id: str) -> dict[int, str]:
         cursor = self._connection.execute(

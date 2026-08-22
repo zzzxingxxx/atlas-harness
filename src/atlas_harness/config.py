@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     max_iterations: int = Field(default=12, gt=0)
     max_tool_calls: int = Field(default=48, gt=0)
 
+    snapshot_every_events: int = Field(default=50, gt=0)
+    """Events between snapshots. Snapshots only shorten replay, so this is a
+    performance knob: losing one costs time on recovery, never correctness."""
+
     def resolved_workspace_root(self) -> Path:
         """Return an absolute, normalized workspace root."""
 

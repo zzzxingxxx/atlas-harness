@@ -21,12 +21,13 @@ from atlas_harness.agent.state import DEFAULT_SYSTEM_PROMPT, BudgetLimits, RunRe
 from atlas_harness.config import Settings
 from atlas_harness.events import DEFAULT_LANE, EventStore, EventType
 from atlas_harness.events.reducer import OperationState
-from atlas_harness.kernel.errors import SessionNotFoundError
-from atlas_harness.kernel.ids import new_id
+from atlas_harness.kernel.errors import RecoveryError, SessionNotFoundError
 from atlas_harness.model.catalog import build_adapter
 from atlas_harness.model.protocol import ModelAdapter
 from atlas_harness.policy.approval import ApprovalGate, FixedApprovalGate
 from atlas_harness.policy.engine import PolicyEngine
+from atlas_harness.session.recovery import RecoveryService
+from atlas_harness.session.service import SessionService
 from atlas_harness.tools.executor import ToolExecutor
 from atlas_harness.tools.registry import ToolRegistry, default_registry
 
@@ -92,6 +93,8 @@ class AgentService:
             ),
             max_output_bytes=settings.max_tool_output_bytes,
         )
+        self.recovery = RecoveryService(store, snapshot_every=settings.snapshot_every_events)
+        self.sessions = SessionService(store, recovery=self.recovery)
 
     @classmethod
     def from_settings(cls, settings: Settings, **kwargs: Any) -> AgentService:
@@ -195,15 +198,26 @@ class AgentService:
     ) -> RunReport:
         """Open or continue a session and drive one operation to a stop cause."""
 
-        target = self.ensure_session(session_id, title=_title(prompt))
-        operation_id = new_id("op")
-        self.store.append_new(
-            EventType.OPERATION_STARTED,
-            session_id=target,
-            payload={"name": "agent_run"},
+        report = self.sessions.startup(
+            session_id=session_id,
+            operation_name="agent_run",
             lane_id=self.lane_id,
-            operation_id=operation_id,
+            title=_title(prompt),
+            workspace_root=str(self.settings.resolved_workspace_root()),
         )
+        if report.blocked or report.operation_id is None:
+            # A crashed run is owed a decision. Scheduling new work on top of it
+            # would bury the question, so the caller has to answer it first.
+            raise RecoveryError(
+                "session has a suspended operation; resume or abort it before running again",
+                details={
+                    "session_id": report.session_id,
+                    "suspended_operations": report.suspended_operation_ids,
+                    "command": None if report.recovery is None else report.recovery.command(),
+                },
+            )
+        target = report.session_id
+        operation_id = report.operation_id
         queues = QueueManager(
             self.store,
             session_id=target,
@@ -220,6 +234,9 @@ class AgentService:
             queues=queues,
             cancel=cancel,
         )
+        # After the terminal operation event, so a snapshot never points into the
+        # middle of a run. A failure here costs a slower next recovery, nothing more.
+        self.recovery.maybe_snapshot(target)
         return RunReport(
             result=result,
             provider=loop.provider,

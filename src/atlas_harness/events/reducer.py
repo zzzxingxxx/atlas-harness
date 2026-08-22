@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 
 from atlas_harness.events.models import (
     CURRENT_SCHEMA_VERSION,
+    DEFAULT_LANE,
+    SUSPENDED_STATUS,
     TERMINAL_OPERATION_EVENTS,
     Event,
     EventType,
@@ -27,6 +29,32 @@ class ToolCallState(BaseModel):
     error: str | None = None
     started_at_ms: int | None = None
     finished_at_ms: int | None = None
+    idempotency_key: str | None = None
+    risk: str | None = None
+    idempotent: bool = False
+    """Declared by the manifest at tool_started time.
+
+    Recorded on the projection so recovery can triage an interrupted call without
+    consulting the registry, which may have changed shape since the log was written.
+    """
+
+    confirmed: bool = False
+    """A human authorized this specific call to run again after a crash.
+
+    Folded from ``operation_resumed``, so the authorization lives in the log and
+    survives a second crash instead of being re-asked forever.
+    """
+
+    @property
+    def replayable(self) -> bool:
+        """True only for a read that the tool itself declares idempotent.
+
+        A write can be idempotent and still be unsafe to replay unattended, so the
+        risk level and the flag both have to agree. Everything else is suspended for
+        a human decision.
+        """
+
+        return self.risk == "read" and self.idempotent
 
 
 class TokenUsageState(BaseModel):
@@ -79,6 +107,11 @@ class OperationState(BaseModel):
     error: str | None = None
     started_at_ms: int | None = None
     finished_at_ms: int | None = None
+    suspend_reason: str | None = None
+    pending_tool_call_ids: list[str] = Field(default_factory=list)
+    """Calls a human still owes a decision on. Empty unless status is suspended."""
+
+    resume_count: int = 0
 
     @property
     def open_tool_call_ids(self) -> list[str]:
@@ -99,6 +132,22 @@ class LaneState(BaseModel):
     status: str = "idle"
     operation_ids: list[str] = Field(default_factory=list)
     current_operation_id: str | None = None
+    parent_lane: str | None = None
+    forked_from_seq: int | None = None
+    label: str | None = None
+
+
+class SnapshotState(BaseModel):
+    """One recorded snapshot. `last_seq` is where recovery resumes replaying."""
+
+    snapshot_id: str
+    lane_id: str
+    last_seq: int = 0
+    state_hash: str | None = None
+    path: str | None = None
+    checksum: str | None = None
+    event_count: int | None = None
+    created_at_ms: int | None = None
 
 
 class SessionState(BaseModel):
@@ -116,6 +165,8 @@ class SessionState(BaseModel):
     operations: dict[str, OperationState] = Field(default_factory=dict)
     approvals: dict[str, bool | None] = Field(default_factory=dict)
     snapshots: list[str] = Field(default_factory=list)
+    snapshot_records: list[SnapshotState] = Field(default_factory=list)
+    current_lane_id: str = DEFAULT_LANE
 
     @property
     def pending_approval_ids(self) -> list[str]:
@@ -128,6 +179,34 @@ class SessionState(BaseModel):
             for operation in self.operations.values()
             if operation.status == "started"
         ]
+
+    @property
+    def suspended_operation_ids(self) -> list[str]:
+        return [
+            operation.operation_id
+            for operation in self.operations.values()
+            if operation.status == SUSPENDED_STATUS
+        ]
+
+    @property
+    def unfinished_operation_ids(self) -> list[str]:
+        """Operations that never reached a terminal event, suspended included."""
+
+        return [
+            operation.operation_id
+            for operation in self.operations.values()
+            if operation.status in {"started", SUSPENDED_STATUS}
+        ]
+
+    def latest_snapshot(self, lane_id: str | None = None) -> SnapshotState | None:
+        candidates = [
+            record
+            for record in self.snapshot_records
+            if lane_id is None or record.lane_id == lane_id
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda record: record.last_seq)
 
     def state_hash(self) -> str:
         """Stable fingerprint so two replays of one log can be compared."""
@@ -171,7 +250,31 @@ class Reducer:
             if operation_id not in lane.operation_ids:
                 lane.operation_ids.append(operation_id)
         elif event.event_type is EventType.SNAPSHOT_CREATED:
-            state.snapshots.append(str(payload.get("snapshot_id") or event.event_id))
+            snapshot_id = str(payload.get("snapshot_id") or event.event_id)
+            state.snapshots.append(snapshot_id)
+            last_seq = payload.get("last_seq")
+            state.snapshot_records.append(
+                SnapshotState(
+                    snapshot_id=snapshot_id,
+                    lane_id=event.lane_id,
+                    last_seq=int(last_seq) if last_seq is not None else max(event.seq - 1, 0),
+                    state_hash=payload.get("state_hash"),
+                    path=payload.get("path"),
+                    checksum=payload.get("checksum"),
+                    event_count=payload.get("event_count"),
+                    created_at_ms=event.timestamp_ms,
+                )
+            )
+        elif event.event_type is EventType.LANE_CREATED:
+            self._declare_lane(str(payload["lane"]), parent=payload.get("parent_lane"))
+        elif event.event_type is EventType.BRANCH_CREATED:
+            branch = self._declare_lane(str(payload["lane"]), parent=payload.get("parent_lane"))
+            from_seq = payload.get("from_seq")
+            branch.forked_from_seq = int(from_seq) if from_seq is not None else event.seq
+            branch.label = payload.get("label") or branch.label
+        elif event.event_type is EventType.BRANCH_SWITCHED:
+            target = self._declare_lane(str(payload["lane"]))
+            state.current_lane_id = target.lane_id
 
         operation = self._resolve_operation(event)
         if operation is not None:
@@ -182,8 +285,18 @@ class Reducer:
             ):
                 lane.status = "idle"
                 lane.current_operation_id = None
+            elif event.event_type is EventType.OPERATION_SUSPENDED:
+                lane.status = SUSPENDED_STATUS
+                lane.current_operation_id = operation.operation_id
+            elif event.event_type is EventType.OPERATION_RESUMED:
+                lane.status = "running"
+                lane.current_operation_id = operation.operation_id
 
         self._apply_session_event(event, payload)
+        if state.status != "created" and state.suspended_operation_ids:
+            state.status = SUSPENDED_STATUS
+        elif state.status == SUSPENDED_STATUS:
+            state.status = "active"
         if state.created_at_ms is None:
             state.created_at_ms = event.timestamp_ms
         state.updated_at_ms = event.timestamp_ms
@@ -205,6 +318,12 @@ class Reducer:
                     "last_valid_seq": self.state.last_seq,
                 },
             )
+
+    def _declare_lane(self, lane_id: str, *, parent: str | None = None) -> LaneState:
+        lane = self.state.lanes.setdefault(lane_id, LaneState(lane_id=lane_id))
+        if parent is not None:
+            lane.parent_lane = parent
+        return lane
 
     def _resolve_operation(self, event: Event) -> OperationState | None:
         if event.operation_id is None:
@@ -243,6 +362,9 @@ class Reducer:
                 tool_name=str(payload["tool_name"]),
                 arguments=dict(payload.get("arguments") or {}),
                 started_at_ms=event.timestamp_ms,
+                idempotency_key=payload.get("idempotency_key"),
+                risk=payload.get("risk"),
+                idempotent=bool(payload.get("idempotent", False)),
             )
         elif event_type is EventType.TOOL_RESULT:
             call_id = str(payload.get("call_id") or event.event_id)
@@ -270,6 +392,26 @@ class Reducer:
             operation.status = "aborted"
             operation.error = payload.get("reason")
             operation.finished_at_ms = event.timestamp_ms
+        elif event_type is EventType.OPERATION_SUSPENDED:
+            operation.status = SUSPENDED_STATUS
+            operation.suspend_reason = str(payload.get("reason", "decision owed"))
+            operation.pending_tool_call_ids = [
+                str(call_id) for call_id in payload.get("pending_tool_call_ids") or []
+            ]
+        elif event_type is EventType.OPERATION_RESUMED:
+            operation.status = "started"
+            operation.suspend_reason = None
+            operation.resume_count += 1
+            confirmed = {str(call_id) for call_id in payload.get("confirmed_tool_call_ids") or []}
+            operation.pending_tool_call_ids = [
+                call_id for call_id in operation.pending_tool_call_ids if call_id not in confirmed
+            ]
+            # The authorization is folded onto the call itself, so a second crash
+            # after the confirmation does not ask the same question again.
+            for call_id in confirmed:
+                authorized = operation.tool_calls.get(call_id)
+                if authorized is not None:
+                    authorized.confirmed = True
         elif event_type is EventType.MODEL_STREAM_COMPLETED:
             operation.model_responses += 1
             operation.stop_reason = payload.get("stop_reason") or operation.stop_reason

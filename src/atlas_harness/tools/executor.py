@@ -41,6 +41,9 @@ LOGGER = logging.getLogger(__name__)
 FAULT_BEFORE_TOOL_STARTED = "tool_executor.before_tool_started"
 FAULT_AFTER_TOOL_STARTED = "tool_executor.after_tool_started"
 FAULT_BEFORE_TOOL_RESULT = "tool_executor.before_tool_result"
+FAULT_AFTER_TOOL_RESULT = "tool_executor.after_tool_result"
+"""A crash here is the case M4 exists for: the side effect landed *and* was
+recorded, so recovery must restore the result instead of running the tool again."""
 
 MAX_ARGUMENT_BYTES = 4_096
 """Arguments are echoed into the event log, so they get their own budget."""
@@ -369,6 +372,7 @@ class ToolExecutor:
                 "arguments": _limit_arguments(call.arguments),
                 "tool_version": manifest.version,
                 "risk": manifest.risk.value,
+                "idempotent": manifest.idempotent,
                 "approval_id": approval_id,
                 "idempotency_key": tool_key,
             },
@@ -438,6 +442,7 @@ class ToolExecutor:
         )
         self.faults.check(FAULT_BEFORE_TOOL_RESULT)
         self._append(EventType.TOOL_RESULT, scope, self._result_payload(outcome))
+        self.faults.check(FAULT_AFTER_TOOL_RESULT)
         return outcome
 
     def _failed(
