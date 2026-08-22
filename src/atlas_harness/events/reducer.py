@@ -29,6 +29,36 @@ class ToolCallState(BaseModel):
     finished_at_ms: int | None = None
 
 
+class TokenUsageState(BaseModel):
+    """Running token total for one operation, summed over model responses."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+class ProviderErrorState(BaseModel):
+    error: str
+    error_code: str | None = None
+    status_code: int | None = None
+    retryable: bool = False
+    attempt: int = 1
+    at_ms: int | None = None
+
+
+class QueueMessageState(BaseModel):
+    message_id: str
+    queue: str
+    content: str = ""
+    source: str = "user"
+    consumed: bool = False
+    enqueued_at_ms: int | None = None
+    consumed_at_ms: int | None = None
+
+
 class OperationState(BaseModel):
     operation_id: str
     lane_id: str
@@ -37,9 +67,14 @@ class OperationState(BaseModel):
     provider: str | None = None
     model: str | None = None
     model_requests: int = 0
+    model_responses: int = 0
+    stop_reason: str | None = None
+    token_usage: TokenUsageState = Field(default_factory=TokenUsageState)
     messages: list[str] = Field(default_factory=list)
     tool_calls: dict[str, ToolCallState] = Field(default_factory=dict)
     approvals: dict[str, bool | None] = Field(default_factory=dict)
+    provider_errors: list[ProviderErrorState] = Field(default_factory=list)
+    queue_messages: dict[str, QueueMessageState] = Field(default_factory=dict)
     result: Any = None
     error: str | None = None
     started_at_ms: int | None = None
@@ -48,6 +83,15 @@ class OperationState(BaseModel):
     @property
     def open_tool_call_ids(self) -> list[str]:
         return [call_id for call_id, call in self.tool_calls.items() if call.status == "started"]
+
+    def pending_queue_messages(self, queue: str) -> list[QueueMessageState]:
+        """Messages enqueued for one queue that no iteration has consumed yet."""
+
+        return [
+            message
+            for message in self.queue_messages.values()
+            if message.queue == queue and not message.consumed
+        ]
 
 
 class LaneState(BaseModel):
@@ -226,6 +270,39 @@ class Reducer:
             operation.status = "aborted"
             operation.error = payload.get("reason")
             operation.finished_at_ms = event.timestamp_ms
+        elif event_type is EventType.MODEL_STREAM_COMPLETED:
+            operation.model_responses += 1
+            operation.stop_reason = payload.get("stop_reason") or operation.stop_reason
+            operation.token_usage.input_tokens += int(payload.get("input_tokens") or 0)
+            operation.token_usage.output_tokens += int(payload.get("output_tokens") or 0)
+        elif event_type is EventType.PROVIDER_ERROR:
+            operation.provider_errors.append(
+                ProviderErrorState(
+                    error=str(payload.get("error", "provider error")),
+                    error_code=payload.get("error_code"),
+                    status_code=payload.get("status_code"),
+                    retryable=bool(payload.get("retryable", False)),
+                    attempt=int(payload.get("attempt") or 1),
+                    at_ms=event.timestamp_ms,
+                )
+            )
+        elif event_type is EventType.QUEUE_MESSAGE_ENQUEUED:
+            message_id = str(payload["message_id"])
+            operation.queue_messages[message_id] = QueueMessageState(
+                message_id=message_id,
+                queue=str(payload["queue"]),
+                content=str(payload.get("content", "")),
+                source=str(payload.get("source", "user")),
+                enqueued_at_ms=event.timestamp_ms,
+            )
+        elif event_type is EventType.QUEUE_MESSAGE_CONSUMED:
+            message_id = str(payload["message_id"])
+            queued = operation.queue_messages.get(message_id) or QueueMessageState(
+                message_id=message_id, queue=str(payload["queue"])
+            )
+            queued.consumed = True
+            queued.consumed_at_ms = event.timestamp_ms
+            operation.queue_messages[message_id] = queued
 
     def reduce(self, events: Iterable[Event]) -> SessionState:
         for event in events:

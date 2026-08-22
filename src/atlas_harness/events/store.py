@@ -22,6 +22,7 @@ from atlas_harness.config import Settings
 from atlas_harness.events.models import (
     CURRENT_SCHEMA_VERSION,
     DEFAULT_LANE,
+    SUPPORTED_SCHEMA_VERSIONS,
     Event,
     EventType,
     Payload,
@@ -351,10 +352,13 @@ class EventStore:
     def append(self, event: Event) -> Event:
         """Persist one event. The log and the index move together or not at all."""
 
-        if event.schema_version != CURRENT_SCHEMA_VERSION:
+        if event.schema_version not in SUPPORTED_SCHEMA_VERSIONS:
             raise EventValidationError(
                 "unsupported event schema version",
-                details={"schema_version": event.schema_version},
+                details={
+                    "schema_version": event.schema_version,
+                    "supported": sorted(SUPPORTED_SCHEMA_VERSIONS),
+                },
             )
         session_id = event.session_id
         path = self.log_path(session_id)

@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "AtlasHarness Contributors" }]
 dependencies = [
+  "httpx>=0.27,<1",
   "pydantic>=2.7,<3",
   "pydantic-settings>=2.2,<3",
   "typer>=0.16,<1",
@@ -45,6 +46,11 @@ extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Typer declares CLI defaults by calling Option/Argument in the signature. The
+# returned descriptors are never mutated, so B008 does not apply to them.
+extend-immutable-calls = ["typer.Argument", "typer.Option"]
 
 [tool.mypy]
 python_version = "3.12"

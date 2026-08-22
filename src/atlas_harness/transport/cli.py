@@ -10,12 +10,17 @@ from typing import Any
 import typer
 
 from atlas_harness import __version__
+from atlas_harness.agent.queues import QueueName, QueueRequest
+from atlas_harness.agent.service import AgentService
 from atlas_harness.config import Settings, load_settings
 from atlas_harness.events import EventStore, EventType, SessionState
 from atlas_harness.kernel.errors import (
     ApprovalDeniedError,
     AtlasError,
+    BudgetExceededError,
+    CancellationError,
     PolicyDeniedError,
+    ProviderError,
     ToolError,
     ToolInputError,
     ToolNotFoundError,
@@ -23,6 +28,7 @@ from atlas_harness.kernel.errors import (
     ToolVersionError,
 )
 from atlas_harness.observability.logging import configure_logging
+from atlas_harness.observability.trace import build_trace
 from atlas_harness.policy import ApprovalGate, ApprovalMode, FixedApprovalGate, PolicyEngine
 from atlas_harness.tools import ToolContext, default_registry, redact, truncate_text
 from atlas_harness.tools.executor import ToolCall, ToolExecutor
@@ -345,6 +351,111 @@ def tool_run(
     _emit(payload, json_output=json_output, lines=lines)
     if not outcome.success:
         raise typer.Exit(code=_TOOL_EXIT_CODES.get(outcome.error_code or "", ToolError.exit_code))
+
+
+_STOP_EXIT_CODES: dict[str, int] = {
+    "provider_error": ProviderError.exit_code,
+    "budget_exceeded": BudgetExceededError.exit_code,
+    "cancelled": CancellationError.exit_code,
+}
+
+
+@app.command()
+def run(
+    ctx: typer.Context,
+    prompt: str = typer.Argument(..., help="What the agent should do."),
+    session_id: str | None = typer.Option(None, "--session", help="Continue an existing session."),
+    provider: str | None = typer.Option(
+        None, "--provider", help="Override ATLAS_MODEL_PROVIDER, e.g. fake."
+    ),
+    model: str | None = typer.Option(None, "--model", help="Override ATLAS_MODEL_NAME."),
+    steer: list[str] = typer.Option(
+        [], "--steer", help="Queue a steer message before the first turn. Repeatable."
+    ),
+    approve: bool = typer.Option(False, "--yes", help="Approve tool calls that need approval."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Run one model -> tool -> result -> model loop and record every step."""
+
+    settings = _settings(ctx)
+    if provider is not None:
+        settings.model_provider = provider
+    if model is not None:
+        settings.model_name = model
+    with _store(ctx) as store:
+        service = AgentService(
+            settings=settings,
+            store=store,
+            approvals=_gate(ApprovalMode(settings.approval_mode), approve),
+        )
+        report = service.run_sync(prompt, session_id=session_id, steer=list(steer))
+    payload = report.summary()
+    payload["answer"] = report.result.answer
+    lines = [
+        f"session: {report.result.session_id}",
+        f"operation: {report.result.operation_id}",
+        f"model: {report.provider}/{report.model}",
+        f"stop: {report.result.stop_cause.value} after {report.result.iterations} "
+        f"iterations, {report.result.tool_calls} tool calls",
+        f"tokens: {report.result.usage.total_tokens}",
+        "",
+        report.result.answer or f"(no answer: {report.result.error or 'none'})",
+    ]
+    _emit(payload, json_output=json_output, lines=lines)
+    if not report.result.succeeded:
+        code = _STOP_EXIT_CODES.get(report.result.error_code or "", ProviderError.exit_code)
+        raise typer.Exit(code=code)
+
+
+@app.command()
+def messages(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session to queue a message for."),
+    content: str | None = typer.Option(None, "--send", help="Message content to enqueue."),
+    queue: QueueName = typer.Option(
+        QueueName.STEER, "--queue", help="Which queue to write to.", case_sensitive=False
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Queue a message for a session, or show what is still pending."""
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        message_id: str | None = None
+        if content is not None:
+            message_id = service.enqueue(
+                QueueRequest(queue=queue, content=content, source="cli"),
+                session_id=session_id,
+            )
+        pending = service.pending_queues(session_id)
+    payload: dict[str, Any] = {
+        "session_id": session_id,
+        "enqueued": message_id,
+        "pending": pending.model_dump(mode="json"),
+    }
+    lines = [f"session: {session_id}"]
+    if message_id is not None:
+        lines.append(f"enqueued {message_id} on {queue.value}")
+    lines.append(
+        f"pending: steer={pending.steer} follow_up={pending.follow_up} next_run={pending.next_run}"
+    )
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command()
+def trace(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session to render as a timeline."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Print every recorded step of a session in order."""
+
+    with _store(ctx) as store:
+        rendered = build_trace(store.read_events(session_id), session_id=session_id)
+    payload = rendered.model_dump(mode="json")
+    payload["counts"] = rendered.counts()
+    _emit(payload, json_output=json_output, lines=rendered.render() or ["no events"])
 
 
 def main() -> None:

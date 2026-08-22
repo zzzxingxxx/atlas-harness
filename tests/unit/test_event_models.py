@@ -4,6 +4,7 @@ from pydantic import ValidationError
 from atlas_harness.events import (
     CURRENT_SCHEMA_VERSION,
     DEFAULT_LANE,
+    SUPPORTED_SCHEMA_VERSIONS,
     AssistantMessage,
     Event,
     EventType,
@@ -85,8 +86,17 @@ def test_unsupported_schema_version_is_rejected(factory: IdFactory) -> None:
 
     assert excinfo.value.details == {
         "schema_version": CURRENT_SCHEMA_VERSION + 1,
-        "supported": CURRENT_SCHEMA_VERSION,
+        "supported": sorted(SUPPORTED_SCHEMA_VERSIONS),
     }
+
+
+def test_previous_schema_version_stays_readable(factory: IdFactory) -> None:
+    """M1/M2 wrote v1 logs; this build must still replay them."""
+
+    data = make_event(factory).to_json_dict()
+    data["schema_version"] = 1
+
+    assert Event.model_validate(data).schema_version == 1
 
 
 def test_unknown_fields_are_rejected(factory: IdFactory) -> None:

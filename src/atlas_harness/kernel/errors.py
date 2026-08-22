@@ -112,3 +112,22 @@ class ToolTimeoutError(ToolError):
 class ToolVersionError(ToolError):
     code = "tool_version_mismatch"
     exit_code = 16
+
+
+class ProviderError(AtlasError):
+    """A model provider failed. ``details`` carries whether a retry may help."""
+
+    code = "provider_error"
+    exit_code = 17
+
+
+class ProviderTimeoutError(ProviderError):
+    code = "provider_timeout"
+    exit_code = 18
+
+
+class ModelResponseError(ProviderError):
+    """The provider answered, but the response could not be trusted."""
+
+    code = "model_response_error"
+    exit_code = 19

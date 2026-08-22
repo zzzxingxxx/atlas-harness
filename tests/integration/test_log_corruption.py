@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from atlas_harness.events import CURRENT_SCHEMA_VERSION, EventStore, EventType
+from atlas_harness.events import (
+    CURRENT_SCHEMA_VERSION,
+    SUPPORTED_SCHEMA_VERSIONS,
+    EventStore,
+    EventType,
+)
 from atlas_harness.kernel import EventLogCorruptionError
 
 SESSION_ID = "ses_bad"
@@ -98,7 +103,7 @@ def test_unsupported_schema_version(log: Path, store_factory: StoreFactory) -> N
 
     assert error.message == "unsupported event schema version"
     assert error.details["schema_version"] == CURRENT_SCHEMA_VERSION + 1
-    assert error.details["supported"] == CURRENT_SCHEMA_VERSION
+    assert error.details["supported"] == sorted(SUPPORTED_SCHEMA_VERSIONS)
     assert error.details["last_valid_seq"] == 3
 
 

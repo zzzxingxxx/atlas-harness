@@ -12,7 +12,11 @@ from atlas_harness.kernel.ids import IdFactory
 
 DEFAULT_LANE = "main"
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
+"""Version written by this build. M3 added the model-stream and queue events."""
+
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2})
+"""Versions this build can read. v1 logs from M1/M2 stay replayable."""
 
 
 class EventType(StrEnum):
@@ -28,6 +32,10 @@ class EventType(StrEnum):
     OPERATION_FAILED = "operation_failed"
     OPERATION_ABORTED = "operation_aborted"
     SNAPSHOT_CREATED = "snapshot_created"
+    MODEL_STREAM_COMPLETED = "model_stream_completed"
+    PROVIDER_ERROR = "provider_error"
+    QUEUE_MESSAGE_ENQUEUED = "queue_message_enqueued"
+    QUEUE_MESSAGE_CONSUMED = "queue_message_consumed"
 
 
 TERMINAL_OPERATION_EVENTS = frozenset(
@@ -109,6 +117,47 @@ class SnapshotCreated(Payload):
     state_hash: str | None = None
 
 
+class ModelStreamCompleted(Payload):
+    """Summary of one model response. The text itself lives in assistant_message."""
+
+    request_id: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    stop_reason: str | None = None
+    iteration: int | None = None
+    text_length: int = 0
+    tool_call_count: int = 0
+    invalid_tool_call_count: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+class ProviderError(Payload):
+    """A provider call failed or its stream broke mid-message."""
+
+    provider: str | None = None
+    model: str | None = None
+    request_id: str | None = None
+    error: str
+    error_code: str | None = None
+    status_code: int | None = None
+    retryable: bool = False
+    attempt: int = 1
+
+
+class QueueMessageEnqueued(Payload):
+    queue: str
+    message_id: str
+    content: str = ""
+    source: str = "user"
+
+
+class QueueMessageConsumed(Payload):
+    queue: str
+    message_id: str
+    iteration: int | None = None
+
+
 PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.SESSION_CREATED: SessionCreated,
     EventType.OPERATION_STARTED: OperationStarted,
@@ -122,6 +171,10 @@ PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.OPERATION_FAILED: OperationFailed,
     EventType.OPERATION_ABORTED: OperationAborted,
     EventType.SNAPSHOT_CREATED: SnapshotCreated,
+    EventType.MODEL_STREAM_COMPLETED: ModelStreamCompleted,
+    EventType.PROVIDER_ERROR: ProviderError,
+    EventType.QUEUE_MESSAGE_ENQUEUED: QueueMessageEnqueued,
+    EventType.QUEUE_MESSAGE_CONSUMED: QueueMessageConsumed,
 }
 
 
@@ -148,10 +201,13 @@ class Event(BaseModel):
         if not isinstance(values, dict):
             return values
         version = values.get("schema_version", CURRENT_SCHEMA_VERSION)
-        if version != CURRENT_SCHEMA_VERSION:
+        if version not in SUPPORTED_SCHEMA_VERSIONS:
             raise EventValidationError(
                 "unsupported event schema version",
-                details={"schema_version": version, "supported": CURRENT_SCHEMA_VERSION},
+                details={
+                    "schema_version": version,
+                    "supported": sorted(SUPPORTED_SCHEMA_VERSIONS),
+                },
             )
         raw_type = values.get("event_type", values.get("type"))
         if "type" in values:
