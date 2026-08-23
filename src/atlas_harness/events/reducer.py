@@ -216,6 +216,55 @@ class SessionState(BaseModel):
     capability_injections: int = 0
     """Requests that carried a capability slot. Zero for a run with injection off."""
 
+    feedback_ids: list[str] = Field(default_factory=list)
+    """Every recorded correction, failure or success, in order. A candidate names the
+    feedback it came from, so this is the half that makes the binding checkable."""
+
+    candidate_ids: list[str] = Field(default_factory=list)
+    """Candidates proposed here. Proposing is not promoting: a candidate on this list
+    with no entry in ``promoted_versions`` never reached a prompt."""
+
+    rejected_candidate_ids: dict[str, str] = Field(default_factory=dict)
+    """Candidate id -> the check that refused it before evaluation. Kept apart from
+    the evaluation verdicts below because a refusal is not a measurement."""
+
+    candidate_verdicts: dict[str, str] = Field(default_factory=dict)
+    """Candidate id -> the verdict of its most recent evaluation. Later evaluations
+    overwrite earlier ones: a re-run after a fix is the answer that governs."""
+
+    promoted_versions: dict[str, str] = Field(default_factory=dict)
+    """Skill id -> the version most recently made effective. This is a pointer, not a
+    history; ``skill_statuses`` above still carries every version's own state."""
+
+    rollbacks: list[str] = Field(default_factory=list)
+    """``skill_id@version`` per rollback, in order, so a replay can say how often a
+    skill has had to be walked back rather than only where it ended up."""
+
+    @property
+    def evaluated_candidate_ids(self) -> list[str]:
+        """Candidates that were actually measured, in proposal order."""
+
+        return [
+            candidate_id
+            for candidate_id in self.candidate_ids
+            if candidate_id in self.candidate_verdicts
+        ]
+
+    @property
+    def pending_candidate_ids(self) -> list[str]:
+        """Proposed, not refused, and not yet evaluated.
+
+        This list is the pending window itself: everything on it is a proposal the
+        system is holding and deliberately not using.
+        """
+
+        return [
+            candidate_id
+            for candidate_id in self.candidate_ids
+            if candidate_id not in self.candidate_verdicts
+            and candidate_id not in self.rejected_candidate_ids
+        ]
+
     @property
     def live_memory_ids(self) -> list[str]:
         """Stored and not since expired."""
@@ -424,6 +473,32 @@ class Reducer:
             state.skill_statuses[label] = str(payload.get("to_status") or "candidate")
         elif event.event_type is EventType.CAPABILITY_INJECTED:
             state.capability_injections += 1
+        elif event.event_type is EventType.FEEDBACK_RECORDED:
+            feedback_id = str(payload["feedback_id"])
+            if feedback_id not in state.feedback_ids:
+                state.feedback_ids.append(feedback_id)
+        elif event.event_type is EventType.SKILL_CANDIDATE_PROPOSED:
+            candidate_id = str(payload["candidate_id"])
+            if candidate_id not in state.candidate_ids:
+                state.candidate_ids.append(candidate_id)
+        elif event.event_type is EventType.SKILL_CANDIDATE_REJECTED:
+            state.rejected_candidate_ids[str(payload["candidate_id"])] = str(
+                payload.get("reason") or "schema"
+            )
+        elif event.event_type is EventType.CANDIDATE_EVALUATED:
+            # The newest verdict wins. An earlier failure followed by a passing
+            # re-run means the candidate is promotable, and a projection that kept
+            # the first answer would keep blocking it.
+            state.candidate_verdicts[str(payload["candidate_id"])] = str(
+                payload.get("verdict") or "fail"
+            )
+        elif event.event_type is EventType.CHAMPION_PROMOTED:
+            state.promoted_versions[str(payload["skill_id"])] = str(payload["to_version"])
+        elif event.event_type is EventType.CHAMPION_ROLLED_BACK:
+            skill_id = str(payload["skill_id"])
+            to_version = str(payload["to_version"])
+            state.promoted_versions[skill_id] = to_version
+            state.rollbacks.append(f"{skill_id}@{to_version}")
 
     def _apply_operation_event(
         self, operation: OperationState, event: Event, payload: dict[str, Any]

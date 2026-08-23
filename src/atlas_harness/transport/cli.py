@@ -15,6 +15,16 @@ from atlas_harness.agent.queues import QueueName, QueueRequest
 from atlas_harness.agent.service import AgentService
 from atlas_harness.config import Settings, load_settings
 from atlas_harness.events import EventStore, EventType, SessionState
+from atlas_harness.evolution import (
+    CandidateStatus,
+    EvaluationRecord,
+    Evaluator,
+    EvolutionPipeline,
+    FeedbackItem,
+    FeedbackKind,
+    SkillCandidate,
+)
+from atlas_harness.evolution.runner import SessionTaskRunner
 from atlas_harness.kernel.clock import SystemClock
 from atlas_harness.kernel.errors import (
     ApprovalDeniedError,
@@ -31,6 +41,7 @@ from atlas_harness.kernel.errors import (
     ToolTimeoutError,
     ToolVersionError,
 )
+from atlas_harness.kernel.ids import new_id
 from atlas_harness.memory import MemoryLayer
 from atlas_harness.observability.logging import configure_logging
 from atlas_harness.observability.trace import build_trace
@@ -694,6 +705,279 @@ def skill_status(
                 reason=reason,
                 evaluation_ref=evaluation_ref,
             )
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload = {"session_id": target, "skill": record.to_payload()}
+    _emit(payload, json_output=json_output, lines=[_skill_line(record)])
+
+
+def _candidate_line(candidate: SkillCandidate) -> str:
+    return (
+        f"{candidate.candidate_id}  {candidate.label}  [{candidate.status.value}]  "
+        f"decision={candidate.decision.value}  "
+        f"evidence={','.join(candidate.evidence_refs) or '-'}  "
+        f"{candidate.description[:60]}"
+    )
+
+
+def _evaluation_lines(record: EvaluationRecord) -> list[str]:
+    metrics = record.metrics
+    lines = [
+        f"{record.evaluation_id}  {record.skill_id}@{record.version}  "
+        f"verdict={record.verdict.value}",
+        f"dataset={record.dataset}  tasks={record.task_count}  "
+        f"champion={record.champion_version or '-'}",
+        f"stages={','.join(record.stages) or '-'}  failed={','.join(record.failed_stages) or '-'}",
+        f"pass@1={metrics.pass_at_1:.2f}  completion={metrics.completion_rate:.2f}  "
+        f"tools={metrics.tool_effectiveness:.2f}  cost=${metrics.cost_usd:.4f}",
+        f"safety_violations={metrics.safety_violation_rate:.2f}  "
+        f"regression={metrics.regression_rate:.2f}  recovery={metrics.recovery_rate:.2f}",
+    ]
+    lines.extend(f"failed task: {task_id}" for task_id in record.failures)
+    lines.extend(f"note: {note}" for note in record.notes)
+    return lines
+
+
+@app.command()
+def feedback(
+    ctx: typer.Context,
+    record: str | None = typer.Option(None, "--record", help="Record this text as feedback."),
+    kind: FeedbackKind = typer.Option(
+        FeedbackKind.CORRECTION, "--kind", help="What kind of feedback.", case_sensitive=False
+    ),
+    source_task: str | None = typer.Option(
+        None, "--task", help="Task the feedback came from. Groups items into one proposal."
+    ),
+    tool_name: str | None = typer.Option(None, "--tool", help="Tool the feedback is about."),
+    evidence: list[str] = typer.Option([], "--evidence", help="Evidence reference. Repeatable."),
+    tag: list[str] = typer.Option([], "--tag", help="Tag to attach. Repeatable."),
+    session_id: str | None = typer.Option(None, "--session", help="Session to record it in."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Record feedback, or list what has been recorded.
+
+    Recording is not proposing. Feedback lands in the log and nothing else happens
+    until ``atlas skill-propose`` reads it, so an operator can correct the agent
+    without that correction turning into a capability behind their back.
+    """
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        try:
+            target = service.ensure_session(session_id, title="feedback")
+            stored = (
+                None
+                if record is None
+                else service.evolution.record_feedback(
+                    FeedbackItem(
+                        feedback_id=new_id("fb"),
+                        kind=kind,
+                        content=record,
+                        source_task=source_task,
+                        source_session_id=target,
+                        tool_name=tool_name,
+                        evidence_refs=tuple(evidence),
+                        tags=tuple(tag),
+                    ),
+                    session_id=target,
+                )
+            )
+            items = service.evolution.all_feedback()
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload: dict[str, Any] = {
+        "session_id": target,
+        "recorded": None if stored is None else stored.to_payload(),
+        "items": [item.to_payload() for item in items],
+    }
+    lines = [] if stored is None else [f"recorded {stored.feedback_id} in {target}"]
+    lines.extend(
+        f"{item.feedback_id}  [{item.kind.value}]  task={item.source_task or '-'}  "
+        f"evidence={','.join(item.evidence_refs) or '-'}  {item.content[:60]}"
+        for item in items
+    )
+    _emit(payload, json_output=json_output, lines=lines or ["no feedback recorded"])
+
+
+@app.command()
+def candidates(
+    ctx: typer.Context,
+    status: CandidateStatus | None = typer.Option(
+        None, "--status", help="Only show candidates in this status.", case_sensitive=False
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """List the pending window: proposals that exist but are not capabilities yet."""
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        records = service.evolution.candidates(status=status)
+    payload = [item.to_payload() | {"status": item.status.value} for item in records]
+    lines = [_candidate_line(item) for item in records] or ["no candidates"]
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command(name="skill-propose")
+def skill_propose(
+    ctx: typer.Context,
+    source_task: str | None = typer.Option(
+        None, "--task", help="Only propose from feedback for this task."
+    ),
+    skill_id: str | None = typer.Option(
+        None, "--skill", help="Propose a new version of this skill instead of a new one."
+    ),
+    session_id: str | None = typer.Option(
+        None, "--session", help="Session to record the proposals in."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Turn recorded feedback into candidate skill versions.
+
+    A proposal is written at ``candidate`` status and cannot be injected. Refusals are
+    written too, so the log distinguishes feedback that was examined and rejected from
+    feedback nobody ever looked at.
+    """
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        pipeline = EvolutionPipeline(service.evolution)
+        try:
+            target = service.ensure_session(session_id, title="skill proposal")
+            items = [
+                item
+                for item in service.evolution.all_feedback()
+                if source_task is None or item.source_task == source_task
+            ]
+            outcomes = (
+                [pipeline.propose_from(items, session_id=target, skill_id=skill_id)]
+                if source_task is not None or skill_id is not None
+                else pipeline.propose_all(items, session_id=target)
+            )
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload = {
+        "session_id": target,
+        "considered": len(items),
+        "outcomes": [
+            {
+                "accepted": outcome.accepted,
+                "decision": outcome.decision.value,
+                "reason": outcome.reason,
+                "detail": outcome.detail,
+                "notes": list(outcome.notes),
+                "candidate": None if outcome.candidate is None else outcome.candidate.to_payload(),
+            }
+            for outcome in outcomes
+        ],
+    }
+    lines = [f"considered {len(items)} feedback item(s) in {target}"]
+    for outcome in outcomes:
+        if outcome.accepted and outcome.candidate is not None:
+            lines.append(f"proposed {_candidate_line(outcome.candidate)}")
+        else:
+            detail = "" if outcome.detail is None else f" ({outcome.detail})"
+            lines.append(f"rejected: {outcome.reason or 'unknown'}{detail}")
+        lines.extend(f"  {note}" for note in outcome.notes)
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command(name="skill-evaluate")
+def skill_evaluate(
+    ctx: typer.Context,
+    candidate_id: str = typer.Argument(..., help="Candidate to measure."),
+    session_id: str | None = typer.Option(
+        None, "--session", help="Session to record the verdict in."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Run a candidate against the fixed task sets and record the verdict.
+
+    The candidate is made effective for the duration of each task and for nothing
+    else: the run sees a view of the skill library, not a changed one, so a crash
+    part-way through cannot leave the candidate live.
+    """
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        pipeline = EvolutionPipeline(
+            service.evolution,
+            evaluator=Evaluator(runner=SessionTaskRunner(service)),
+        )
+        try:
+            target = service.ensure_session(session_id, title="skill evaluation")
+            evaluation = pipeline.evaluate(candidate_id, session_id=target)
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload = {"session_id": target, "evaluation": evaluation.to_payload()}
+    _emit(payload, json_output=json_output, lines=_evaluation_lines(evaluation))
+    if not evaluation.passed:
+        raise typer.Exit(code=ToolError.exit_code)
+
+
+@app.command(name="skill-promote")
+def skill_promote(
+    ctx: typer.Context,
+    candidate_id: str = typer.Argument(..., help="Candidate to make effective."),
+    reason: str | None = typer.Option(None, "--reason", help="Why it is being promoted."),
+    session_id: str | None = typer.Option(
+        None, "--session", help="Session to record the promotion in."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Make an evaluated candidate the champion, using its most recent verdict.
+
+    A candidate with no evaluation, or whose newest evaluation did not pass, is
+    refused here. That refusal is the evaluation gate: it is the only way a version
+    reaches ``active``.
+    """
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        pipeline = EvolutionPipeline(service.evolution)
+        try:
+            target = service.ensure_session(session_id, title="skill promotion")
+            record = pipeline.promote(candidate_id, session_id=target, reason=reason)
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload = {"session_id": target, "skill": record.to_payload()}
+    _emit(payload, json_output=json_output, lines=[_skill_line(record)])
+
+
+@app.command(name="skill-rollback")
+def skill_rollback(
+    ctx: typer.Context,
+    skill_id: str = typer.Argument(..., help="Skill to roll back."),
+    to_version: str = typer.Option(..., "--to", help="Version to make effective again."),
+    reason: str | None = typer.Option(None, "--reason", help="Why it is being rolled back."),
+    session_id: str | None = typer.Option(
+        None, "--session", help="Session to record the rollback in."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Make a previously deprecated version effective again.
+
+    Only a version this skill already had can be named. Rolling back to something
+    that was never registered would be a promotion with no evaluation behind it, so
+    the command lists the available versions and refuses instead.
+    """
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        pipeline = EvolutionPipeline(service.evolution)
+        try:
+            target = service.ensure_session(session_id, title="skill rollback")
+            record = pipeline.rollback(skill_id, to_version, session_id=target, reason=reason)
         except AtlasError as error:
             typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
             raise typer.Exit(code=error.exit_code) from error

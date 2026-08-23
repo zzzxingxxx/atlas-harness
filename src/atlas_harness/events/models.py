@@ -12,11 +12,11 @@ from atlas_harness.kernel.ids import IdFactory
 
 DEFAULT_LANE = "main"
 
-CURRENT_SCHEMA_VERSION = 5
-"""Version written by this build. M6 added the memory, skill and injection events."""
+CURRENT_SCHEMA_VERSION = 6
+"""Version written by this build. M7 added the feedback, candidate and champion events."""
 
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
-"""Versions this build can read. v1-v4 logs from M1-M5 stay replayable."""
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})
+"""Versions this build can read. v1-v5 logs from M1-M6 stay replayable."""
 
 
 class EventType(StrEnum):
@@ -49,6 +49,12 @@ class EventType(StrEnum):
     SKILL_REGISTERED = "skill_registered"
     SKILL_STATUS_CHANGED = "skill_status_changed"
     CAPABILITY_INJECTED = "capability_injected"
+    FEEDBACK_RECORDED = "feedback_recorded"
+    SKILL_CANDIDATE_PROPOSED = "skill_candidate_proposed"
+    SKILL_CANDIDATE_REJECTED = "skill_candidate_rejected"
+    CANDIDATE_EVALUATED = "candidate_evaluated"
+    CHAMPION_PROMOTED = "champion_promoted"
+    CHAMPION_ROLLED_BACK = "champion_rolled_back"
 
 
 TERMINAL_OPERATION_EVENTS = frozenset(
@@ -423,6 +429,163 @@ class CapabilityInjected(Payload):
     skipped: list[CapabilitySkip] = Field(default_factory=list)
 
 
+FEEDBACK_KINDS = frozenset({"correction", "failure", "success"})
+"""Where a candidate may come from. The plan names exactly these three sources, and
+keeping them closed is what lets a candidate's provenance be grouped and audited."""
+
+CANDIDATE_DECISIONS = frozenset({"add", "merge", "reject"})
+"""What retrieval against the existing skills decided to do with a candidate."""
+
+CANDIDATE_REJECTIONS = frozenset(
+    {
+        "schema",
+        "lint",
+        "security",
+        "duplicate",
+        "no_evidence",
+        "low_signal",
+    }
+)
+"""Why a candidate never reached evaluation. Separate from the evaluation verdict:
+a candidate refused by the security check was never measured, and an audit that
+could not tell those apart would read a refusal as a failing score."""
+
+EVALUATION_STAGES = frozenset({"rules", "judge", "shadow"})
+"""The three checks the plan requires, in the order they run. A stage that did not
+run is absent rather than recorded as passing."""
+
+EVALUATION_VERDICTS = frozenset({"pass", "fail", "inconclusive"})
+"""``inconclusive`` exists because a judge that could not be reached is not a pass.
+Promotion requires ``pass``, so an unavailable evaluator blocks rather than waves
+a candidate through."""
+
+
+class EvaluationMetrics(Payload):
+    """The seven numbers the plan requires from every evaluation.
+
+    All seven are always present, even at zero: a consumer comparing a candidate
+    against the champion must not have to tell a missing key apart from a real
+    zero, and a regression is exactly the kind of thing an absent field hides.
+    """
+
+    pass_at_1: float = 0.0
+    completion_rate: float = 0.0
+    tool_effectiveness: float = 0.0
+    cost_usd: float = 0.0
+    safety_violation_rate: float = 0.0
+    regression_rate: float = 0.0
+    recovery_rate: float = 0.0
+
+
+class FeedbackRecorded(Payload):
+    """One correction, failure or success worth learning from.
+
+    ``evidence_refs`` is not decoration. The plan requires a candidate to bind to
+    its source, and a feedback item with no evidence cannot support one, so this
+    is where the binding starts rather than where it is inferred later.
+    """
+
+    feedback_id: str
+    kind: str = "correction"
+    content: str = ""
+    source_task: str | None = None
+    source_session_id: str | None = None
+    tool_name: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    created_at_ms: int | None = None
+
+
+class SkillCandidateProposed(Payload):
+    """A proposed skill version, bound to the feedback that produced it.
+
+    A candidate is a *proposal*, never an effective capability: it is registered at
+    ``candidate`` status, and the missing ``draft -> active`` edge plus the
+    active-only injection filter are what keep it out of a prompt until an
+    evaluation says otherwise.
+    """
+
+    candidate_id: str
+    skill_id: str
+    version: str = "0.1.0"
+    decision: str = "add"
+    name: str | None = None
+    description: str = ""
+    body: str = ""
+    triggers: list[str] = Field(default_factory=list)
+    required_scopes: list[str] = Field(default_factory=list)
+    feedback_refs: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    merged_from: str | None = None
+    """Existing skill version this candidate merges into, when ``decision`` is
+    ``merge``. Kept so a merge can be told from an unrelated new skill."""
+    created_at_ms: int | None = None
+
+
+class SkillCandidateRejected(Payload):
+    """A candidate refused before evaluation, with the check that refused it."""
+
+    candidate_id: str
+    skill_id: str | None = None
+    reason: str = "schema"
+    detail: str | None = None
+
+
+class CandidateEvaluated(Payload):
+    """One evaluation of one candidate against the fixed task set.
+
+    The champion's own numbers travel alongside the candidate's. A verdict on its
+    own cannot answer whether a passing candidate is actually better than what is
+    already serving requests, and that comparison is the promotion decision.
+    """
+
+    evaluation_id: str
+    candidate_id: str
+    skill_id: str
+    version: str = "0.1.0"
+    dataset: str = ""
+    verdict: str = "fail"
+    stages: list[str] = Field(default_factory=list)
+    failed_stages: list[str] = Field(default_factory=list)
+    metrics: EvaluationMetrics = Field(default_factory=EvaluationMetrics)
+    baseline_metrics: EvaluationMetrics | None = None
+    champion_version: str | None = None
+    task_count: int = 0
+    failures: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    evaluated_at_ms: int | None = None
+
+
+class ChampionPromoted(Payload):
+    """A candidate became the effective version, naming the evaluation that let it.
+
+    ``from_version`` is the version being displaced, and it is deprecated rather
+    than retired: a rollback needs somewhere to roll back to.
+    """
+
+    skill_id: str
+    to_version: str
+    from_version: str | None = None
+    candidate_id: str | None = None
+    evaluation_id: str | None = None
+    reason: str | None = None
+
+
+class ChampionRolledBack(Payload):
+    """The effective version moved back to a named earlier version.
+
+    ``to_version`` is explicit rather than "the previous one": inferring it from
+    history would make the outcome depend on how many promotions happened since,
+    and a rollback is the one operation that must land somewhere known.
+    """
+
+    skill_id: str
+    to_version: str
+    from_version: str | None = None
+    reason: str | None = None
+    evaluation_id: str | None = None
+
+
 PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.SESSION_CREATED: SessionCreated,
     EventType.OPERATION_STARTED: OperationStarted,
@@ -453,6 +616,12 @@ PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.SKILL_REGISTERED: SkillRegistered,
     EventType.SKILL_STATUS_CHANGED: SkillStatusChanged,
     EventType.CAPABILITY_INJECTED: CapabilityInjected,
+    EventType.FEEDBACK_RECORDED: FeedbackRecorded,
+    EventType.SKILL_CANDIDATE_PROPOSED: SkillCandidateProposed,
+    EventType.SKILL_CANDIDATE_REJECTED: SkillCandidateRejected,
+    EventType.CANDIDATE_EVALUATED: CandidateEvaluated,
+    EventType.CHAMPION_PROMOTED: ChampionPromoted,
+    EventType.CHAMPION_ROLLED_BACK: ChampionRolledBack,
 }
 
 

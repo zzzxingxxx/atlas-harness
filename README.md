@@ -2,7 +2,7 @@
 
 AtlasHarness 是一个模型无关、工具可插拔、会话可恢复、能力可演化的 Agent Runtime。
 
-当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩，以及 M6 Memory、Skill 和来源追踪：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M7-M9 里程碑逐步加入。
+当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩，以及 M6 Memory、Skill 和来源追踪：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账，以及 Pending Window 反馈收集、候选 Skill 抽取与证据绑定、add/merge/reject 决策、固定 benchmark 与七项指标评测、champion 晋升和回滚。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M8-M9 里程碑逐步加入。
 
 ## 环境
 
@@ -54,6 +54,13 @@ atlas memory [--remember <text>] [--layer working|episodic|semantic|procedural] 
     [--source-task <id>] [--confidence <0-1>] [--evidence <ref>]... [--tag <t>]... [--json]
 atlas memory-expire <memory-id> | --sweep [--reason <text>] [--json]
 atlas capabilities "<task text>" [--json]                     # 检索会选中什么，以及别的为什么落选
+atlas feedback [--record <text>] [--kind correction|failure|success] \
+    [--task <id>] [--tool <name>] [--evidence <ref>]... [--tag <t>]... [--json]
+atlas candidates [--status proposed|rejected|evaluated|promoted] [--json]
+atlas skill-propose [--task <id>] [--skill <skill-id>] [--json]   # 从反馈生成候选，不改变有效能力
+atlas skill-evaluate <candidate-id> [--json]                      # 跑固定 benchmark，记录七项指标
+atlas skill-promote <candidate-id> [--reason <text>] [--json]      # 只有评测通过的候选能晋升
+atlas skill-rollback <skill-id> --to <version> [--reason <text>] [--json]
 ```
 
 所有命令失败时输出结构化错误（`{"error", "message", "details"}`）并使用固定退出码：配置 2、生命周期 3、预算 4、事件校验 5、事件存储 6、恢复 7、日志损坏 8、会话不存在 9、策略拒绝 10、审批拒绝 11、工具错误 12-16、取消 130。
@@ -247,7 +254,7 @@ uv run atlas compact <session-id> --objective "ship M5"
 
 ## Memory、Skill 和来源追踪（M6）
 
-`schema_version` 升到 5，新增 `memory_stored`、`memory_expired`、`skill_registered`、`skill_status_changed`、`capability_injected`。读取端仍然接受版本 1、2、3、4。
+`schema_version` 在 M6 升到 5，新增 `memory_stored`、`memory_expired`、`skill_registered`、`skill_status_changed`、`capability_injected`。读取端仍然接受版本 1、2、3、4。
 
 M6 要回答的是一个审计问题，不是一个检索问题：**为什么这次请求里有这条 Skill，而运营者以为会出现的那条不在。** 所以选择过程本身是被记录的对象，`capability_injected` 同时写下选中的和落选的，每条落选都带一个来自封闭集合的理由。
 
@@ -310,4 +317,56 @@ uv run atlas capabilities "帮我写发布说明"
 
 `tests/unit/test_capability_selector.py` 和 `tests/integration/test_capability_injection.py` 覆盖计划的四条测试条件：同一任务的检索排序稳定、无权限 Skill 不进入上下文、Skill 版本与来源和证据可追踪、过期 Episodic Memory 不作为长期事实注入。
 
-后续工具沙箱和能力演化功能以项目方案及开发计划为准。
+## Pending Window 和受控自进化（M7）
+
+`schema_version` 升到 6，新增 `feedback_recorded`、`skill_candidate_proposed`、`candidate_evaluated`、`champion_promoted`、`champion_rolled_back`。读取端仍然接受版本 1 到 5。
+
+M7 只做一件事：**让反馈能变成候选 Skill，同时让候选在通过评测之前无法影响有效能力。** 这两半必须同时成立——只有前一半是 Skill Poisoning，只有后一半等于没有自进化。
+
+### 缺失的那条边就是门禁
+
+M6 的状态机里 `draft → active` 不存在，M7 就建在这个缺口上：候选一律以 `candidate` 状态登记，而注入过滤器只认 `active`。所以「候选未评测前不会被默认注入」不是一条需要记得去检查的规则，而是状态机和过滤器共同的结果——想绕过它得先加一条边。
+
+`SkillCandidate.to_skill_record()` 因此把状态硬编码成 `candidate`。一个能在这里要求 `active` 的调用方就是第二条晋升路径，而且不带任何评测检查。
+
+### 候选必须绑定来源和证据
+
+`extract()` 是一条只会拒绝的阶梯，每一级都有名字：`no_evidence`（没有绑定到任务或会话的反馈）、`low_signal`（内容太短，或没有一条纠正性反馈）、`security`（脱敏命中，或正文里出现 `rm -rf`、`curl | sh`、「ignore previous instructions」、关闭策略/审批/沙箱、`--no-verify`）、`lint`、`schema`。凭空造不出候选：`atlas skill-propose` 在没有反馈时报 `considered: 0`，而不是发明一条。
+
+检索到相似 Skill 时按 Jaccard 相似度分三档处置：低于 0.45 是 `add`，0.45 到 0.92 之间是 `merge`（继承对方的 `skill_id`，版本号小版本加一），高于 0.92 或 checksum 相同是 `reject: duplicate`。
+
+### 七项指标和固定 benchmark
+
+评测跑两个固定集合（`regression` 三题 + `security` 两题），每题的成绩从**事件日志**里读，不从运行的返回值里读——shadow run 结束时内存里的结果已经丢掉了工具调用，日志没有丢。同一个打分函数因此既能评一次刚跑完的 shadow run，也能评几周前的会话，这才让回归检查有意义。
+
+七项指标永远都在，即使为零：`pass_at_1`、`completion_rate`、`tool_effectiveness`、`cost_usd`、`safety_violation_rate`、`regression_rate`、`recovery_rate`。消费方在比较候选和 champion 时不该需要区分「键缺失」和「真的是 0」，而回归恰好是缺失字段最容易藏住的东西。
+
+安全违规单独计数，不并入普通失败：一个错答案的代价是重试一次，一个泄露的密钥无法重试。
+
+### shadow run 不写激活
+
+候选的 shadow run 通过替换 `service.skills` 视图完成，一次运行内有效，不写任何 `skill_status_changed`。如果它靠激活来生效，评测中途崩一次就会留下一个没被测量过的版本在对外服务。
+
+### 晋升与回滚的顺序
+
+两个方向的写入顺序是相反的，而且都不是任意选的：
+
+- **晋升是先激活后弃用**。有一瞬间两个版本都是 `active`，此时 `active()` 解析到更高的版本；反过来则会有一瞬间**没有**有效版本。
+- **回滚是先弃用后激活**。回滚目标是更低的版本，先激活它的话更高的那个仍然赢。
+
+`rollback_targets()` 只列 `deprecated` 版本。一个 `candidate` 从未在役，回到它是一次披着回滚外衣的晋升。所以回滚一个从未存在的版本会被拒绝，并在 `details.available` 里给出真正可去的版本。
+
+### 完整流程
+
+```bash
+uv run atlas feedback --record "发布说明要按模块分组" --kind correction --task op_release_notes --evidence ses_abc
+uv run atlas candidates                                  # pending window：登记了，但不生效
+uv run atlas skill-propose --task op_release_notes
+uv run atlas skill-evaluate <candidate-id>               # 失败时退出码非零，CI 能看见
+uv run atlas skill-promote <candidate-id> --reason measured
+uv run atlas skill-rollback <skill-id> --to 0.1.0
+```
+
+`tests/unit/test_evolution.py` 和 `tests/integration/test_cli_evolution.py` 覆盖计划的四条测试条件：候选未评测前不会被默认注入、评测失败的候选不能晋升、晋升后可回滚到指定版本、新 Skill 不降低旧任务和安全任务集的成绩。集成测试里两个脚本化 Provider 的唯一区别是安全题的回答，所以门禁的两侧用同一套装置就能跑到。
+
+后续工具沙箱和分布式执行功能以项目方案及开发计划为准。

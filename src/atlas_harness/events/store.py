@@ -187,6 +187,57 @@ CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5 (
     row_key UNINDEXED,
     tokenize = 'unicode61'
 );
+CREATE TABLE IF NOT EXISTS feedback (
+    feedback_id       TEXT PRIMARY KEY,
+    session_id        TEXT,
+    kind              TEXT NOT NULL,
+    content           TEXT NOT NULL DEFAULT '',
+    source_task       TEXT,
+    source_session_id TEXT,
+    tool_name         TEXT,
+    evidence_json     TEXT NOT NULL DEFAULT '[]',
+    tags_json         TEXT NOT NULL DEFAULT '[]',
+    created_at_ms     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS feedback_kind ON feedback (kind, created_at_ms);
+CREATE TABLE IF NOT EXISTS skill_candidates (
+    candidate_id   TEXT PRIMARY KEY,
+    skill_id       TEXT NOT NULL,
+    version        TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'proposed',
+    decision       TEXT NOT NULL DEFAULT 'add',
+    name           TEXT,
+    description    TEXT NOT NULL DEFAULT '',
+    body           TEXT NOT NULL DEFAULT '',
+    triggers_json  TEXT NOT NULL DEFAULT '[]',
+    scopes_json    TEXT NOT NULL DEFAULT '[]',
+    feedback_json  TEXT NOT NULL DEFAULT '[]',
+    evidence_json  TEXT NOT NULL DEFAULT '[]',
+    merged_from    TEXT,
+    reject_reason  TEXT,
+    created_at_ms  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS skill_candidates_skill
+    ON skill_candidates (skill_id, status);
+CREATE TABLE IF NOT EXISTS candidate_evaluations (
+    evaluation_id      TEXT PRIMARY KEY,
+    candidate_id       TEXT NOT NULL,
+    skill_id           TEXT NOT NULL,
+    version            TEXT NOT NULL,
+    dataset            TEXT NOT NULL DEFAULT '',
+    verdict            TEXT NOT NULL,
+    stages_json        TEXT NOT NULL DEFAULT '[]',
+    failed_stages_json TEXT NOT NULL DEFAULT '[]',
+    metrics_json       TEXT NOT NULL DEFAULT '{}',
+    baseline_json      TEXT,
+    champion_version   TEXT,
+    task_count         INTEGER NOT NULL DEFAULT 0,
+    failures_json      TEXT NOT NULL DEFAULT '[]',
+    notes_json         TEXT NOT NULL DEFAULT '[]',
+    evaluated_at_ms    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS candidate_evaluations_candidate
+    ON candidate_evaluations (candidate_id, evaluated_at_ms);
 """
 
 _INSERT_EVENT = """

@@ -25,6 +25,7 @@ from atlas_harness.context.compaction import REASON_MANUAL, CompactionSummary, C
 from atlas_harness.context.tokens import ContextBudget
 from atlas_harness.events import DEFAULT_LANE, EventStore, EventType
 from atlas_harness.events.reducer import OperationState
+from atlas_harness.evolution.repository import EvolutionRepository
 from atlas_harness.kernel.errors import (
     LifecycleError,
     RecoveryError,
@@ -109,6 +110,7 @@ class AgentService:
         self.memories = MemoryRepository(store)
         self.skills = SkillRepository(store)
         self.retriever = MemoryRetriever(self.memories)
+        self.evolution = EvolutionRepository(store, skills=self.skills)
 
     @classmethod
     def from_settings(cls, settings: Settings, **kwargs: Any) -> AgentService:
