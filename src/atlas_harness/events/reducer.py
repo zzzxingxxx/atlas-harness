@@ -121,6 +121,18 @@ class OperationState(BaseModel):
     """Large outputs moved out of the context. The bytes are still on disk, so a
     compaction never costs evidence."""
 
+    capability_injections: int = 0
+    injected_memory_ids: list[str] = Field(default_factory=list)
+    injected_skill_versions: list[str] = Field(default_factory=list)
+    """What this operation's prompts actually carried, de-duplicated across
+    iterations. Retrieval runs per iteration and usually returns the same records,
+    so a raw append would report one skill twenty times."""
+
+    capability_skips: dict[str, int] = Field(default_factory=dict)
+    """Skip reason -> how often it fired. This is the half that answers "why is the
+    skill I expected missing": a count against ``not_permitted`` is a scope problem,
+    against ``budget`` a sizing one, and against ``no_match`` a retrieval one."""
+
     @property
     def open_tool_call_ids(self) -> list[str]:
         return [call_id for call_id, call in self.tool_calls.items() if call.status == "started"]
@@ -182,6 +194,34 @@ class SessionState(BaseModel):
     compactions: int = 0
     """How many times the context was compacted. The messages above are unaffected
     -- compaction replaces the prompt, not the record."""
+
+    memory_ids: list[str] = Field(default_factory=list)
+    """Memories this session stored, in order. Ids only; the content is in the log
+    and in the searchable index, neither of which the projection duplicates."""
+
+    expired_memory_ids: list[str] = Field(default_factory=list)
+    """Memories that left the retrievable set. Kept as a separate list rather than
+    removed from ``memory_ids``, because expiry is not deletion: a replay still has
+    to be able to say the memory existed and when it stopped being used."""
+
+    skill_versions: list[str] = Field(default_factory=list)
+    """Every ``skill_id@version`` registered here, so a version that was later
+    retired is still visible as something the session once knew about."""
+
+    skill_statuses: dict[str, str] = Field(default_factory=dict)
+    """Current status per ``skill_id@version``. Folded from the transitions rather
+    than read from the table, so a replay of the log alone can say which version
+    was injectable at the end -- the projection never has to trust the index."""
+
+    capability_injections: int = 0
+    """Requests that carried a capability slot. Zero for a run with injection off."""
+
+    @property
+    def live_memory_ids(self) -> list[str]:
+        """Stored and not since expired."""
+
+        expired = set(self.expired_memory_ids)
+        return [memory_id for memory_id in self.memory_ids if memory_id not in expired]
 
     @property
     def pending_approval_ids(self) -> list[str]:
@@ -366,6 +406,24 @@ class Reducer:
             state.artifacts.append(str(payload["artifact_id"]))
         elif event.event_type is EventType.CONTEXT_COMPACTED:
             state.compactions += 1
+        elif event.event_type is EventType.MEMORY_STORED:
+            memory_id = str(payload["memory_id"])
+            if memory_id not in state.memory_ids:
+                state.memory_ids.append(memory_id)
+        elif event.event_type is EventType.MEMORY_EXPIRED:
+            expired = str(payload["memory_id"])
+            if expired not in state.expired_memory_ids:
+                state.expired_memory_ids.append(expired)
+        elif event.event_type is EventType.SKILL_REGISTERED:
+            label = f"{payload['skill_id']}@{payload.get('version') or '0.1.0'}"
+            if label not in state.skill_versions:
+                state.skill_versions.append(label)
+            state.skill_statuses[label] = str(payload.get("status") or "draft")
+        elif event.event_type is EventType.SKILL_STATUS_CHANGED:
+            label = f"{payload['skill_id']}@{payload.get('version') or '0.1.0'}"
+            state.skill_statuses[label] = str(payload.get("to_status") or "candidate")
+        elif event.event_type is EventType.CAPABILITY_INJECTED:
+            state.capability_injections += 1
 
     def _apply_operation_event(
         self, operation: OperationState, event: Event, payload: dict[str, Any]
@@ -479,6 +537,25 @@ class Reducer:
             operation.last_compaction_reason = str(payload.get("reason") or "threshold")
         elif event_type is EventType.ARTIFACT_STORED:
             operation.artifact_ids.append(str(payload["artifact_id"]))
+        elif event_type is EventType.CAPABILITY_INJECTED:
+            operation.capability_injections += 1
+            for selection in payload.get("selected") or []:
+                if not isinstance(selection, dict):
+                    continue
+                ref_id = str(selection.get("ref_id") or "")
+                if not ref_id:
+                    continue
+                if selection.get("kind") == "skill":
+                    label = f"{ref_id}@{selection.get('version') or '0.1.0'}"
+                    if label not in operation.injected_skill_versions:
+                        operation.injected_skill_versions.append(label)
+                elif ref_id not in operation.injected_memory_ids:
+                    operation.injected_memory_ids.append(ref_id)
+            for skip in payload.get("skipped") or []:
+                if not isinstance(skip, dict):
+                    continue
+                reason = str(skip.get("reason") or "no_match")
+                operation.capability_skips[reason] = operation.capability_skips.get(reason, 0) + 1
 
     def reduce(self, events: Iterable[Event]) -> SessionState:
         for event in events:

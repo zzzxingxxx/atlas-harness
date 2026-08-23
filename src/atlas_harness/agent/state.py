@@ -162,6 +162,19 @@ class RunState:
         self.compact_pending = False
         return removed
 
+    def last_user_text(self) -> str:
+        """The most recent user turn, which is what capability retrieval queries.
+
+        The latest turn rather than the original prompt: a steer message changes
+        what the run is doing now, and retrieving against the opening request would
+        keep serving the model capabilities for a task it has moved on from.
+        """
+
+        for message in reversed(self._messages):
+            if message.role is Role.USER and message.content:
+                return message.content
+        return ""
+
     def last_assistant_text(self) -> str:
         """The most recent non-empty assistant text, i.e. the answer so far."""
 

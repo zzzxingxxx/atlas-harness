@@ -144,6 +144,49 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS snapshots_lane_seq
     ON snapshots (session_id, lane, seq);
+CREATE TABLE IF NOT EXISTS memories (
+    memory_id         TEXT PRIMARY KEY,
+    session_id        TEXT,
+    layer             TEXT NOT NULL,
+    content           TEXT NOT NULL,
+    source_task       TEXT,
+    source_session_id TEXT,
+    created_at_ms     INTEGER NOT NULL,
+    expires_at_ms     INTEGER,
+    confidence        REAL NOT NULL DEFAULT 0.5,
+    evidence_json     TEXT NOT NULL DEFAULT '[]',
+    tags_json         TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS memories_layer ON memories (layer, expires_at_ms);
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5 (
+    content,
+    tags,
+    memory_id UNINDEXED,
+    tokenize = 'unicode61'
+);
+CREATE TABLE IF NOT EXISTS skills (
+    skill_id        TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    name            TEXT,
+    description     TEXT NOT NULL DEFAULT '',
+    body            TEXT NOT NULL DEFAULT '',
+    source_path     TEXT,
+    checksum        TEXT,
+    scopes_json     TEXT NOT NULL DEFAULT '[]',
+    triggers_json   TEXT NOT NULL DEFAULT '[]',
+    evidence_json   TEXT NOT NULL DEFAULT '[]',
+    source_task     TEXT,
+    registered_at_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (skill_id, version)
+);
+CREATE INDEX IF NOT EXISTS skills_status ON skills (status, skill_id);
+CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5 (
+    description,
+    triggers,
+    row_key UNINDEXED,
+    tokenize = 'unicode61'
+);
 """
 
 _INSERT_EVENT = """

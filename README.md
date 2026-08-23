@@ -2,7 +2,7 @@
 
 AtlasHarness 是一个模型无关、工具可插拔、会话可恢复、能力可演化的 Agent Runtime。
 
-当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复，以及 M5 上下文编译器与结构化压缩：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M6-M9 里程碑逐步加入。
+当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩，以及 M6 Memory、Skill 和来源追踪：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M7-M9 里程碑逐步加入。
 
 ## 环境
 
@@ -46,6 +46,14 @@ atlas resume <session-id> [--confirm <tool-call-id>]... [--json]
 atlas abort <session-id> [--reason <text>] [--json]
 atlas lanes <session-id> [--json]       # 列出 Lane 及各自的分支来源
 atlas compact <session-id> [--operation <id>] [--objective <text>] [--json]
+atlas skills [--status draft|candidate|active|deprecated|retired] [--json]
+atlas skills-load [--dir <path>] [--session <id>] [--json]   # 注册磁盘上的 Skill 文件
+atlas skill-status <skill-id> [--version <v>] --to <status> \
+    [--reason <text>] [--evaluation <ref>] [--json]           # 沿生命周期推进一个版本
+atlas memory [--remember <text>] [--layer working|episodic|semantic|procedural] \
+    [--source-task <id>] [--confidence <0-1>] [--evidence <ref>]... [--tag <t>]... [--json]
+atlas memory-expire <memory-id> | --sweep [--reason <text>] [--json]
+atlas capabilities "<task text>" [--json]                     # 检索会选中什么，以及别的为什么落选
 ```
 
 所有命令失败时输出结构化错误（`{"error", "message", "details"}`）并使用固定退出码：配置 2、生命周期 3、预算 4、事件校验 5、事件存储 6、恢复 7、日志损坏 8、会话不存在 9、策略拒绝 10、审批拒绝 11、工具错误 12-16、取消 130。
@@ -236,5 +244,70 @@ uv run atlas compact <session-id> --objective "ship M5"
 模型侧有 `compact_context` 工具，但这个工具本身不做压缩：它只记录意图，重写由 Loop 完成——一个能重写自己 prompt 的模型也能把 `fixed` 槽位丢掉。自动压缩在每轮迭代 drain 队列之后测量，所以一条把 prompt 顶过线的 steer 消息会算在它到达的那一轮里。
 
 `tests/integration/test_compaction_loop.py` 验证计划的完成条件：一个固定长任务经过至少一次自动压缩后仍然继续执行并完成。
+
+## Memory、Skill 和来源追踪（M6）
+
+`schema_version` 升到 5，新增 `memory_stored`、`memory_expired`、`skill_registered`、`skill_status_changed`、`capability_injected`。读取端仍然接受版本 1、2、3、4。
+
+M6 要回答的是一个审计问题，不是一个检索问题：**为什么这次请求里有这条 Skill，而运营者以为会出现的那条不在。** 所以选择过程本身是被记录的对象，`capability_injected` 同时写下选中的和落选的，每条落选都带一个来自封闭集合的理由。
+
+### 四层 Memory 和它们的来源
+
+| 层 | 默认 TTL | 权重 | 用途 |
+| --- | --- | --- | --- |
+| `working` | 1 小时 | 0.5 | 当前任务的临时事实 |
+| `episodic` | 14 天 | 0.6 | 发生过什么 |
+| `semantic` | 无 | 0.9 | 关于项目的长期事实 |
+| `procedural` | 无 | 1.0 | 怎么做一件事 |
+
+每条 Memory 都带来源任务、创建时间、过期时间、置信度和证据引用，检索得分是 `文本分 × 层权重 × (0.5 + 0.5 × 置信度)`。层权重让一条 `procedural` 记录压过一条同样匹配的 `working` 记录——短期噪音不该和长期结论竞争。
+
+**过期不是删除。** `atlas memory-expire` 写一条 `memory_expired` 并把条目从 FTS 索引里摘掉，投影行和原始的 `memory_stored` 事件都留着，所以回放仍然能说出这条 Memory 存在过、以及它什么时候停止被使用。真正删除需要显式的管理命令、审计记录和备份策略。这也是 Reducer 把 `expired_memory_ids` 和 `memory_ids` 分成两个列表的原因：合成一个就分不出「从未存在」和「不再有效」。
+
+过期的 `episodic` 记录**不会**作为长期事实注入。它在排序之前就被过滤掉，而不是被降权——降权意味着在候选稀少时它仍然可能挤进 limit-N 的结果里。
+
+### 检索为什么是稳定的
+
+SQLite `bm25()` 返回负值、越负越好，`memory/retrieval.py::score_for()` 和 `SkillRepository.search()` 都做了翻转，下游一律「越大越好」。排序键是 `(-score, -created_at_ms, memory_id)`：id 是一个全序，所以并列项的先后与索引遍历顺序无关，同一个任务每次得到同一个排序。
+
+MATCH 查询里每个词都被引号包起来再用 `OR` 连接——散文里裸露的 `AND`、`NEAR`、`*` 都是 FTS5 语法，不加引号会让一句正常的话变成语法错误。
+
+### Skill 的版本状态机
+
+Skill 从 YAML/JSON 文件加载，带 `skill_id`、`version`、`triggers`、`required_scopes`、`source_task`、`evidence_refs`。状态图是：
+
+```
+draft ──→ candidate ──→ active ──→ deprecated
+  │           │           │            │
+  └───────────┴───────────┴────────────┴──→ retired
+```
+
+`draft → active` 这条边故意不存在，**缺失的这条边就是评测门禁**：一次提升必须先经过 `candidate`，并在 `--evaluation` 里带上评测引用。加载也不等于启用——`LOADABLE_STATUSES` 只有 `draft` 和 `candidate`，一个文件无法宣布自己 `active`，所以往目录里放一个文件不能让它进入下一次请求的上下文。
+
+### 选择流水线
+
+按计划的顺序：规则预筛 → 检索 → 权限过滤 → token 排序 → 少量注入。每一级只能拒绝，后面看到的东西不会被前面藏起来。
+
+- **声明的 trigger 压过任何文本分**（记 10.0）。trigger 是作者对「什么时候该用我」的直接陈述，不该取决于 BM25 有没有恰好索引到对的词。
+- **权限不是排序信号**。`required_scopes` 超出授权的 Skill 记为 `not_permitted` 直接拒绝，而不是降权。注入它只会换来一次策略必然拒绝的调用，白花一轮迭代去发现 harness 已经知道的事。授权来自 `AgentService.build_selector()` 传进去的 `executor.policy.granted_scopes`，选择器和执行器读的是同一份，不会出现「注入了但执行不了」。
+- **预算紧张时 Skill 先于 Memory**。Skill 是怎么做，Memory 是是什么；只装得下一个的 prompt 拿指令比拿事实更有用。
+- **`_fit()` 是首次适应，不是背包**。为了塞进两条边缘条目而跳过一条高相关条目，会让同一个查询随着库增长产生不同的上下文。
+- 注入是**每次请求**的事：`_request_messages()` 只把选中的内容放进 `ModelRequest`，从不写进 `RunState`，所以关掉 `ATLAS_INJECT_CAPABILITIES` 得到的就是 M6 之前的 prompt——这正是评测检索本身需要的对照。
+
+落选理由是一个封闭集合：`not_permitted`、`not_active`、`expired`、`below_threshold`、`over_limit`、`budget`、`duplicate`。空的能力槽位因此是可解释的，而不是「什么都没匹配上」和「全都没权限」看起来一样。
+
+### 从命令行看一次选择
+
+```bash
+uv run atlas skills-load --dir ./skills          # 全部登记为 draft/candidate
+uv run atlas skill-status release-notes --version 1.0.0 --to candidate
+uv run atlas skill-status release-notes --version 1.0.0 --to active --evaluation eval-42
+uv run atlas memory --remember "发布说明写在 docs/releases 下" --layer semantic --confidence 0.9
+uv run atlas capabilities "帮我写发布说明"
+```
+
+`capabilities` 跑的是 Agent Loop 跑的同一个选择器、用的是执行器强制的同一份授权，所以一条无权限的 Skill 在这里显示为带理由的 `-` 行，而不是一个排名很低的 `+` 行。
+
+`tests/unit/test_capability_selector.py` 和 `tests/integration/test_capability_injection.py` 覆盖计划的四条测试条件：同一任务的检索排序稳定、无权限 Skill 不进入上下文、Skill 版本与来源和证据可追踪、过期 Episodic Memory 不作为长期事实注入。
 
 后续工具沙箱和能力演化功能以项目方案及开发计划为准。

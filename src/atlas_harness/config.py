@@ -64,6 +64,33 @@ class Settings(BaseSettings):
     long run fail on its token budget instead, which is occasionally what a test
     wants and never what a user does."""
 
+    skills_dir: Path = Path(".atlas/skills")
+    """Where ``atlas skills load`` reads YAML/JSON skill definitions from. Relative
+    paths resolve below the workspace root, so a project's skills travel with it."""
+
+    inject_capabilities: bool = True
+    """Retrieve and inject Memory and Skill into each request. Off means the loop
+    builds prompts exactly as it did before M6, which is the comparison an
+    evaluation of the retrieval itself needs."""
+
+    capability_token_budget: int = Field(default=1_500, gt=0)
+    """Tokens the capability slot may spend. Separate from the context budget: this
+    caps what retrieval may *add*, so a growing store cannot quietly crowd out the
+    transcript even while the whole prompt still fits."""
+
+    max_injected_memories: int = Field(default=5, gt=0)
+    max_injected_skills: int = Field(default=3, gt=0)
+    """Small on purpose. Recall improves with more candidates; the model's ability
+    to act on them does not, and every one displaces conversation."""
+
+    def resolved_skills_dir(self) -> Path:
+        """Resolve the skill directory below the workspace root when relative."""
+
+        skills_dir = self.skills_dir.expanduser()
+        if not skills_dir.is_absolute():
+            skills_dir = self.resolved_workspace_root() / skills_dir
+        return skills_dir.resolve()
+
     def resolved_workspace_root(self) -> Path:
         """Return an absolute, normalized workspace root."""
 

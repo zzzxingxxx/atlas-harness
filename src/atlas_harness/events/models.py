@@ -12,11 +12,11 @@ from atlas_harness.kernel.ids import IdFactory
 
 DEFAULT_LANE = "main"
 
-CURRENT_SCHEMA_VERSION = 4
-"""Version written by this build. M5 added the compaction and artifact events."""
+CURRENT_SCHEMA_VERSION = 5
+"""Version written by this build. M6 added the memory, skill and injection events."""
 
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
-"""Versions this build can read. v1-v3 logs from M1-M4 stay replayable."""
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5})
+"""Versions this build can read. v1-v4 logs from M1-M5 stay replayable."""
 
 
 class EventType(StrEnum):
@@ -44,6 +44,11 @@ class EventType(StrEnum):
     CONTEXT_COMPACT_PENDING = "context_compact_pending"
     CONTEXT_COMPACTED = "context_compacted"
     ARTIFACT_STORED = "artifact_stored"
+    MEMORY_STORED = "memory_stored"
+    MEMORY_EXPIRED = "memory_expired"
+    SKILL_REGISTERED = "skill_registered"
+    SKILL_STATUS_CHANGED = "skill_status_changed"
+    CAPABILITY_INJECTED = "capability_injected"
 
 
 TERMINAL_OPERATION_EVENTS = frozenset(
@@ -284,6 +289,140 @@ class ArtifactStored(Payload):
     preview: str | None = None
 
 
+MEMORY_LAYERS = frozenset({"working", "episodic", "semantic", "procedural"})
+"""The four layers the plan names. A closed set so retrieval can weight by layer
+and an audit can group by it; an unknown layer is refused rather than stored."""
+
+SKILL_STATUSES = frozenset({"draft", "candidate", "active", "deprecated", "retired"})
+"""A skill's lifecycle. Only ``active`` may be injected: a candidate that has not
+passed evaluation must not become the effective version."""
+
+INJECTABLE_SKILL_STATUSES = frozenset({"active"})
+"""Statuses allowed into a prompt. Kept separate from :data:`SKILL_STATUSES` so
+widening the lifecycle never silently widens what reaches the model."""
+
+CAPABILITY_KINDS = frozenset({"memory", "skill"})
+
+SKIP_REASONS = frozenset(
+    {
+        "no_match",
+        "below_threshold",
+        "not_permitted",
+        "expired",
+        "not_active",
+        "budget",
+        "duplicate",
+        "over_limit",
+    }
+)
+"""Why a candidate was not injected. The plan requires the trace to explain the
+choice, which means the rejections need names as stable as the selections."""
+
+
+class MemoryStored(Payload):
+    """One memory record with the provenance the plan requires.
+
+    ``expires_at_ms`` is what keeps a stale episodic observation from being read
+    back as a long-term fact: retrieval compares it against the clock rather than
+    trusting the record's age.
+    """
+
+    memory_id: str
+    layer: str = "working"
+    content: str = ""
+    source_task: str | None = None
+    source_session_id: str | None = None
+    created_at_ms: int | None = None
+    expires_at_ms: int | None = None
+    confidence: float = 0.5
+    evidence_refs: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+
+
+class MemoryExpired(Payload):
+    """A memory left the retrievable set. The record itself stays in the log."""
+
+    memory_id: str
+    layer: str = "working"
+    reason: str = "ttl"
+    expired_at_ms: int | None = None
+
+
+class SkillRegistered(Payload):
+    """A skill version became known. Registration is not activation.
+
+    The instruction ``body`` travels in the event rather than being left on disk.
+    A skill file can be edited or deleted after the fact, and a log that recorded
+    only a path could no longer say what the model was actually told; ``checksum``
+    is then a way to notice the file drifted, not the only copy of the text.
+    """
+
+    skill_id: str
+    version: str = "0.1.0"
+    status: str = "draft"
+    name: str | None = None
+    description: str = ""
+    body: str = ""
+    source_path: str | None = None
+    checksum: str | None = None
+    required_scopes: list[str] = Field(default_factory=list)
+    triggers: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    source_task: str | None = None
+    registered_at_ms: int | None = None
+
+
+class SkillStatusChanged(Payload):
+    """A lifecycle transition, with the evaluation that justified it."""
+
+    skill_id: str
+    version: str = "0.1.0"
+    from_status: str = "draft"
+    to_status: str = "candidate"
+    reason: str | None = None
+    evaluation_ref: str | None = None
+
+
+class CapabilitySelection(Payload):
+    """One item that entered the capability slot."""
+
+    kind: str = "memory"
+    ref_id: str
+    version: str | None = None
+    layer: str | None = None
+    score: float = 0.0
+    tokens: int = 0
+    source_task: str | None = None
+    source_path: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
+class CapabilitySkip(Payload):
+    """One candidate that did not, and the named reason it did not."""
+
+    kind: str = "memory"
+    ref_id: str
+    reason: str = "no_match"
+    detail: str | None = None
+
+
+class CapabilityInjected(Payload):
+    """What the capability slot held for one model request.
+
+    Both halves are recorded. The selections alone would let an operator see what
+    the model read; the skips are what let them answer why something they expected
+    is missing, which is the question an audit actually asks.
+    """
+
+    query: str = ""
+    iteration: int | None = None
+    token_budget: int = 0
+    tokens_used: int = 0
+    granted_scopes: list[str] = Field(default_factory=list)
+    selected: list[CapabilitySelection] = Field(default_factory=list)
+    skipped: list[CapabilitySkip] = Field(default_factory=list)
+
+
 PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.SESSION_CREATED: SessionCreated,
     EventType.OPERATION_STARTED: OperationStarted,
@@ -309,6 +448,11 @@ PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.CONTEXT_COMPACT_PENDING: ContextCompactPending,
     EventType.CONTEXT_COMPACTED: ContextCompacted,
     EventType.ARTIFACT_STORED: ArtifactStored,
+    EventType.MEMORY_STORED: MemoryStored,
+    EventType.MEMORY_EXPIRED: MemoryExpired,
+    EventType.SKILL_REGISTERED: SkillRegistered,
+    EventType.SKILL_STATUS_CHANGED: SkillStatusChanged,
+    EventType.CAPABILITY_INJECTED: CapabilityInjected,
 }
 
 

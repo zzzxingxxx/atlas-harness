@@ -6,6 +6,7 @@ import pytest
 
 from atlas_harness.config import Settings
 from atlas_harness.events import (
+    SUPPORTED_SCHEMA_VERSIONS,
     Event,
     EventBus,
     EventStore,
@@ -133,7 +134,10 @@ def test_unsupported_schema_version_is_refused_on_append(store: EventStore) -> N
     with pytest.raises(EventValidationError) as excinfo:
         store.append(event)
 
-    assert excinfo.value.details == {"schema_version": 99, "supported": [1, 2, 3, 4]}
+    assert excinfo.value.details == {
+        "schema_version": 99,
+        "supported": sorted(SUPPORTED_SCHEMA_VERSIONS),
+    }
     assert not store.session_exists("ses_a")
 
 

@@ -20,6 +20,7 @@ from atlas_harness.agent.queues import QueueManager, QueueName, QueueRequest, Qu
 from atlas_harness.agent.state import DEFAULT_SYSTEM_PROMPT, BudgetLimits, RunResult
 from atlas_harness.config import Settings
 from atlas_harness.context.artifacts import ArtifactStore
+from atlas_harness.context.capability import CapabilitySelector
 from atlas_harness.context.compaction import REASON_MANUAL, CompactionSummary, Compactor
 from atlas_harness.context.tokens import ContextBudget
 from atlas_harness.events import DEFAULT_LANE, EventStore, EventType
@@ -29,12 +30,15 @@ from atlas_harness.kernel.errors import (
     RecoveryError,
     SessionNotFoundError,
 )
+from atlas_harness.memory.repository import MemoryRepository
+from atlas_harness.memory.retrieval import MemoryRetriever
 from atlas_harness.model.catalog import build_adapter
 from atlas_harness.model.protocol import ModelAdapter
 from atlas_harness.policy.approval import ApprovalGate, FixedApprovalGate
 from atlas_harness.policy.engine import PolicyEngine
 from atlas_harness.session.recovery import RecoveryService
 from atlas_harness.session.service import SessionService
+from atlas_harness.skills.repository import SkillRepository
 from atlas_harness.tools.executor import ToolExecutor
 from atlas_harness.tools.registry import ToolRegistry, default_registry
 
@@ -102,6 +106,9 @@ class AgentService:
         )
         self.recovery = RecoveryService(store, snapshot_every=settings.snapshot_every_events)
         self.sessions = SessionService(store, recovery=self.recovery)
+        self.memories = MemoryRepository(store)
+        self.skills = SkillRepository(store)
+        self.retriever = MemoryRetriever(self.memories)
 
     @classmethod
     def from_settings(cls, settings: Settings, **kwargs: Any) -> AgentService:
@@ -125,6 +132,26 @@ class AgentService:
     def _model_name(self) -> str:
         return self.adapter.capabilities().model
 
+    def build_selector(self) -> CapabilitySelector | None:
+        """Build the capability selector, or ``None`` when injection is off.
+
+        The grant comes from the executor's own policy rather than a second copy
+        in settings. A selector working from a wider grant than the executor
+        enforces would offer the model skills whose tools are refused the moment
+        it tries them; a narrower one would hide skills that would have worked.
+        """
+
+        if not self.settings.inject_capabilities:
+            return None
+        return CapabilitySelector(
+            retriever=self.retriever,
+            skills=self.skills,
+            granted_scopes=self.executor.policy.granted_scopes,
+            token_budget=self.settings.capability_token_budget,
+            max_memories=self.settings.max_injected_memories,
+            max_skills=self.settings.max_injected_skills,
+        )
+
     def build_loop(self) -> AgentLoop:
         capabilities = self.adapter.capabilities()
         return AgentLoop(
@@ -146,6 +173,7 @@ class AgentService:
             artifacts=ArtifactStore(
                 self.store, inline_limit=self.settings.max_artifact_inline_bytes
             ),
+            capabilities=self.build_selector(),
         )
 
     def ensure_session(self, session_id: str | None, *, title: str) -> str:

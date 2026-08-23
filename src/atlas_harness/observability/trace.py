@@ -147,7 +147,67 @@ def _detail(event: Event) -> str:
             return _clip(str(payload.get("reason") or ""))
         case EventType.SNAPSHOT_CREATED:
             return _clip(str(payload.get("snapshot_id") or ""))
+        case EventType.MEMORY_STORED:
+            return _clip(
+                f"{payload.get('layer')} {payload.get('memory_id')} "
+                f"confidence={payload.get('confidence')} "
+                f"expires={payload.get('expires_at_ms')}"
+            )
+        case EventType.MEMORY_EXPIRED:
+            return _clip(
+                f"{payload.get('layer')} {payload.get('memory_id')} reason={payload.get('reason')}"
+            )
+        case EventType.SKILL_REGISTERED:
+            return _clip(
+                f"{payload.get('skill_id')}@{payload.get('version')} "
+                f"status={payload.get('status')} "
+                f"scopes={payload.get('required_scopes') or []} "
+                f"source={payload.get('source_path') or '-'}"
+            )
+        case EventType.SKILL_STATUS_CHANGED:
+            return _clip(
+                f"{payload.get('skill_id')}@{payload.get('version')} "
+                f"{payload.get('from_status')} -> {payload.get('to_status')} "
+                f"evaluation={payload.get('evaluation_ref') or '-'}"
+            )
+        case EventType.CAPABILITY_INJECTED:
+            return _clip(_capability_detail(payload))
     return ""
+
+
+def _capability_detail(payload: dict[str, object]) -> str:
+    """Render one injection as chosen items plus the reasons the rest were not.
+
+    The skips are summarised by reason rather than listed individually. A trace
+    line has to fit on a line, and "2 skipped: not_permitted" is the part an
+    operator reads first; ``atlas capabilities`` prints the per-item detail.
+    """
+
+    selected = payload.get("selected")
+    skipped = payload.get("skipped")
+    chosen = ", ".join(_capability_ref(item) for item in _rows(selected)) or "none"
+    reasons: dict[str, int] = {}
+    for item in _rows(skipped):
+        reason = str(item.get("reason") or "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    detail = f"selected={chosen} tokens={payload.get('tokens_used')}"
+    if reasons:
+        counted = ", ".join(f"{reason}×{count}" for reason, count in sorted(reasons.items()))
+        detail = f"{detail} skipped={counted}"
+    return detail
+
+
+def _rows(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _capability_ref(item: dict[str, object]) -> str:
+    version = item.get("version")
+    ref = str(item.get("ref_id") or "?")
+    label = ref if version is None else f"{ref}@{version}"
+    return f"{item.get('kind')}:{label}"
 
 
 def trace_line(event: Event) -> TraceLine:

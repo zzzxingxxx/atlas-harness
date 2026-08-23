@@ -34,6 +34,7 @@ from atlas_harness.agent.state import (
     steer_messages,
 )
 from atlas_harness.context.artifacts import ArtifactStore
+from atlas_harness.context.capability import CapabilityPlan, CapabilitySelector
 from atlas_harness.context.compaction import (
     REASON_MANUAL,
     CompactionResult,
@@ -54,6 +55,7 @@ from atlas_harness.model.protocol import (
     ModelMessage,
     ModelRequest,
     ModelToolCall,
+    Role,
     TokenInput,
 )
 from atlas_harness.tools.builtin.compact_context import COMPACT_TOOL_NAME
@@ -160,6 +162,7 @@ class AgentLoop:
         compactor: Compactor | None = None,
         counter: TokenCounter | None = None,
         artifacts: ArtifactStore | None = None,
+        capabilities: CapabilitySelector | None = None,
         keep_recent_messages: int = 4,
     ) -> None:
         self.adapter = adapter
@@ -184,6 +187,10 @@ class AgentLoop:
         self.compactor = compactor or Compactor(store, budget=self.budget)
         self.counter: TokenCounter = counter or EstimatingCounter()
         self.artifacts = artifacts or ArtifactStore(store)
+        # Left as None when no memory or skill store is configured. Injecting
+        # nothing is different from injecting an empty selection: the latter
+        # would write a capability_injected event per iteration saying so.
+        self.capabilities = capabilities
         self.keep_recent_messages = keep_recent_messages
 
     @property
@@ -375,11 +382,58 @@ class AgentLoop:
     def _build_request(self, state: RunState) -> ModelRequest:
         return ModelRequest(
             model=self.model,
-            messages=state.messages,
+            messages=self._request_messages(state),
             tools=self._declarations,
             max_output_tokens=self.max_output_tokens,
             temperature=self.temperature,
         )
+
+    def _request_messages(self, state: RunState) -> tuple[ModelMessage, ...]:
+        """The transcript plus whatever capabilities this iteration selected.
+
+        The selection is added to the *request*, not to ``state``. A memory or
+        skill is retrieved fresh for each iteration against the current user turn,
+        so appending it to the transcript would accumulate stale capabilities and
+        make the prompt grow with every pass; and unlike a message, an injected
+        capability is not something the conversation said.
+
+        Injection sits directly after the system prompt: it is instruction, and a
+        skill placed after the transcript would read as the newest turn rather
+        than as standing guidance.
+        """
+
+        plan = self._select_capabilities(state)
+        if plan is None or not plan.selected:
+            return state.messages
+        injected = tuple(
+            ModelMessage(role=item.role, content=item.content) for item in plan.items()
+        )
+        messages = state.messages
+        head = messages[:1] if messages and messages[0].role is Role.SYSTEM else ()
+        return head + injected + messages[len(head) :]
+
+    def _select_capabilities(self, state: RunState) -> CapabilityPlan | None:
+        """Select for this iteration and record what was chosen and what was not.
+
+        The event is written even when nothing was selected, provided a candidate
+        was considered: "the store held three skills and none were permitted" is
+        the answer an audit needs, and an absent event cannot give it.
+        """
+
+        if self.capabilities is None:
+            return None
+        query = state.last_user_text()
+        if not query:
+            return None
+        plan = self.capabilities.select(query)
+        if not plan.selected and not plan.skipped:
+            return plan
+        self._append(
+            EventType.CAPABILITY_INJECTED,
+            state,
+            plan.to_payload(iteration=state.iterations),
+        )
+        return plan
 
     async def _ask(
         self, state: RunState, *, cancel: asyncio.Event | None

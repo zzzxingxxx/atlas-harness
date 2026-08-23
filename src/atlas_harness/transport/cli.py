@@ -5,6 +5,7 @@ import json
 import platform
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -14,11 +15,13 @@ from atlas_harness.agent.queues import QueueName, QueueRequest
 from atlas_harness.agent.service import AgentService
 from atlas_harness.config import Settings, load_settings
 from atlas_harness.events import EventStore, EventType, SessionState
+from atlas_harness.kernel.clock import SystemClock
 from atlas_harness.kernel.errors import (
     ApprovalDeniedError,
     AtlasError,
     BudgetExceededError,
     CancellationError,
+    ConfigurationError,
     PolicyDeniedError,
     ProviderError,
     RecoveryError,
@@ -28,12 +31,14 @@ from atlas_harness.kernel.errors import (
     ToolTimeoutError,
     ToolVersionError,
 )
+from atlas_harness.memory import MemoryLayer
 from atlas_harness.observability.logging import configure_logging
 from atlas_harness.observability.trace import build_trace
 from atlas_harness.policy import ApprovalGate, ApprovalMode, FixedApprovalGate, PolicyEngine
 from atlas_harness.session.branches import BranchService
 from atlas_harness.session.recovery import RecoveryPlan
 from atlas_harness.session.service import SessionService
+from atlas_harness.skills import SkillRecord, SkillStatus, load_directory, parse_status
 from atlas_harness.tools import ToolContext, default_registry, redact, truncate_text
 from atlas_harness.tools.executor import ToolCall, ToolExecutor
 
@@ -579,6 +584,261 @@ def compact(
         summary.as_text(),
     ]
     _emit(payload, json_output=json_output, lines=lines)
+
+
+def _skill_line(record: SkillRecord) -> str:
+    return (
+        f"{record.label}  [{record.status.value}]  "
+        f"scopes={','.join(record.required_scopes) or '-'}  "
+        f"triggers={','.join(record.triggers) or '-'}  "
+        f"source={record.source_path or '-'}"
+    )
+
+
+@app.command()
+def skills(
+    ctx: typer.Context,
+    status: SkillStatus | None = typer.Option(
+        None, "--status", help="Only show versions in this status.", case_sensitive=False
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """List registered skill versions with their status, scopes and source."""
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        records = service.skills.all(status=status)
+    payload = [record.to_payload() for record in records]
+    lines = [_skill_line(record) for record in records] or ["no skills registered"]
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command(name="skills-load")
+def skills_load(
+    ctx: typer.Context,
+    directory: Path | None = typer.Option(
+        None, "--dir", help="Directory to read from (default: ATLAS_SKILLS_DIR)."
+    ),
+    session_id: str | None = typer.Option(
+        None, "--session", help="Session to record the registrations in."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Register the skill files found on disk.
+
+    Loading is not activating. Every file arrives as draft or candidate, so a freshly
+    loaded skill is known to the harness but not yet readable by the model; promote it
+    with ``atlas skill-status ... --to active`` once it has an evaluation behind it.
+    """
+
+    settings = _settings(ctx)
+    root = (directory or settings.resolved_skills_dir()).expanduser()
+    result = load_directory(root)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        try:
+            target = service.ensure_session(session_id, title="skill registration")
+            registered = [
+                service.skills.register(record, session_id=target) for record in result.records
+            ]
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload: dict[str, Any] = {
+        "directory": str(root),
+        "session_id": target,
+        "registered": [record.to_payload() for record in registered],
+        "errors": [{"path": str(item.path), "message": item.message} for item in result.errors],
+    }
+    lines = [f"loaded {len(registered)} skill(s) from {root} into {target}"]
+    lines.extend(_skill_line(record) for record in registered)
+    lines.extend(f"error {item.path}: {item.message}" for item in result.errors)
+    _emit(payload, json_output=json_output, lines=lines)
+    if result.errors:
+        raise typer.Exit(code=ConfigurationError.exit_code)
+
+
+@app.command(name="skill-status")
+def skill_status(
+    ctx: typer.Context,
+    skill_id: str = typer.Argument(..., help="Skill to move along the lifecycle."),
+    version: str = typer.Option("0.1.0", "--version", help="Which version to move."),
+    to_status: str = typer.Option(..., "--to", help="Target status."),
+    session_id: str | None = typer.Option(
+        None, "--session", help="Session to record the transition in."
+    ),
+    reason: str | None = typer.Option(None, "--reason", help="Why the status is changing."),
+    evaluation_ref: str | None = typer.Option(
+        None, "--evaluation", help="Reference to the evaluation behind a promotion."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Move one skill version along the lifecycle graph.
+
+    ``draft`` cannot reach ``active`` directly: the missing edge is the evaluation
+    gate, so a promotion goes draft to candidate first and carries ``--evaluation``.
+    """
+
+    settings = _settings(ctx)
+    target_status = parse_status(to_status)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        try:
+            target = service.ensure_session(session_id, title="skill lifecycle")
+            record = service.skills.set_status(
+                skill_id,
+                version,
+                target_status,
+                session_id=target,
+                reason=reason,
+                evaluation_ref=evaluation_ref,
+            )
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload = {"session_id": target, "skill": record.to_payload()}
+    _emit(payload, json_output=json_output, lines=[_skill_line(record)])
+
+
+@app.command()
+def memory(
+    ctx: typer.Context,
+    remember: str | None = typer.Option(None, "--remember", help="Store this text as a memory."),
+    layer: MemoryLayer = typer.Option(
+        MemoryLayer.SEMANTIC, "--layer", help="Which memory layer to write.", case_sensitive=False
+    ),
+    source_task: str | None = typer.Option(
+        None, "--source-task", help="Task this memory came from."
+    ),
+    confidence: float = typer.Option(0.5, "--confidence", min=0.0, max=1.0),
+    evidence: list[str] = typer.Option([], "--evidence", help="Evidence reference. Repeatable."),
+    tag: list[str] = typer.Option([], "--tag", help="Tag to attach. Repeatable."),
+    session_id: str | None = typer.Option(None, "--session", help="Session to record it in."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Store a memory, or list what is stored and whether it still counts."""
+
+    settings = _settings(ctx)
+    now_ms = SystemClock().now_ms()
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        try:
+            target = service.ensure_session(session_id, title="memory management")
+            stored = (
+                None
+                if remember is None
+                else service.memories.remember(
+                    remember,
+                    session_id=target,
+                    layer=layer,
+                    source_task=source_task,
+                    confidence=confidence,
+                    evidence_refs=tuple(evidence),
+                    tags=tuple(tag),
+                )
+            )
+            records = service.memories.all()
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload: dict[str, Any] = {
+        "session_id": target,
+        "stored": None if stored is None else stored.to_payload(),
+        "records": [record.to_payload() for record in records],
+    }
+    lines = [] if stored is None else [f"stored {stored.memory_id} in {target}"]
+    lines.extend(
+        f"{record.memory_id}  [{record.layer.value}]  "
+        f"confidence={record.confidence:.2f}  "
+        f"{'expired' if record.is_expired(now_ms) else 'live'}  "
+        f"{record.content[:60]}"
+        for record in records
+    )
+    _emit(payload, json_output=json_output, lines=lines or ["no memories stored"])
+
+
+@app.command(name="memory-expire")
+def memory_expire(
+    ctx: typer.Context,
+    memory_id: str | None = typer.Argument(None, help="Memory to retire."),
+    sweep: bool = typer.Option(False, "--sweep", help="Retire everything already past its TTL."),
+    reason: str = typer.Option("manual", "--reason", help="Why it is being retired."),
+    session_id: str | None = typer.Option(
+        None, "--session", help="Session to record the expiry in."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Take memories out of the retrievable set.
+
+    Expiry is not deletion. The row and the original ``memory_stored`` event both
+    stay, so a replay can still say the memory existed and when it stopped being
+    used; removing it for good needs an explicit management command and a backup.
+    """
+
+    if memory_id is None and not sweep:
+        typer.echo("pass a memory id or --sweep", err=True)
+        raise typer.Exit(code=ToolInputError.exit_code)
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        try:
+            target = service.ensure_session(session_id, title="memory management")
+            if sweep:
+                expired = service.memories.sweep(session_id=target)
+            else:
+                assert memory_id is not None  # guarded above
+                record = service.memories.expire(memory_id, session_id=target, reason=reason)
+                expired = [] if record is None else [record.memory_id]
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+    payload = {"session_id": target, "expired": expired}
+    lines = [f"expired {len(expired)} memory record(s)", *expired] or ["nothing to expire"]
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command()
+def capabilities(
+    ctx: typer.Context,
+    query: str = typer.Argument(..., help="Task text to retrieve capabilities for."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Show what a task would retrieve, and why everything else was left out.
+
+    This runs the same selector the agent loop runs, against the same grant the
+    executor enforces, so an unpermitted skill shows up here as skipped rather than
+    as low-ranked -- which is the explanation the plan asks the trace to give.
+    """
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        selector = service.build_selector()
+        plan = None if selector is None else selector.select(query)
+    if plan is None:
+        payload: dict[str, Any] = {"query": query, "injection": "disabled"}
+        _emit(payload, json_output=json_output, lines=["capability injection is disabled"])
+        return
+    explained = plan.explain()
+    lines = [
+        f"query: {query}",
+        f"tokens: {plan.tokens_used}/{plan.token_budget}",
+        f"scopes: {','.join(plan.granted_scopes) or '-'}",
+        "",
+    ]
+    lines.extend(
+        f"+ {choice.kind} {choice.ref_id}"
+        f"{'' if choice.version is None else '@' + choice.version}  "
+        f"score={choice.score:.4f} tokens={choice.tokens}"
+        for choice in plan.selected
+    )
+    lines.extend(
+        f"- {skip.kind} {skip.ref_id}  {skip.reason}"
+        f"{'' if skip.detail is None else ' (' + skip.detail + ')'}"
+        for skip in plan.skipped
+    )
+    _emit(explained, json_output=json_output, lines=lines)
 
 
 @app.command()
