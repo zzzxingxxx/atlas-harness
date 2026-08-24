@@ -96,7 +96,7 @@ uv run atlas release-check --samples samples
 - **HTTP 传输层没有认证**。默认绑 loopback。绑到 `0.0.0.0` 等于把整个工作区交给网络。任何非本机部署必须在前面加一层认证代理。
 - **工具执行没有沙箱**。`run_command` 的隔离完全由白名单和参数校验提供，没有 namespace、cgroup 或 seccomp。计划把沙箱列为后续功能。
 - **没做过渗透测试**。上面每一项都是白盒的属性测试，不是对抗性测试。
-- **OpenAI 兼容 adapter 没有对真实 endpoint 发过请求**，只有 fake provider 覆盖。这是功能性缺口，但也意味着与真实 provider 交互时的错误处理路径未经验证。
+- **真实 provider 的行为不在自动化门禁内**。`atlas model-check` 会对配置好的 endpoint 发一次真实请求并打印裁决，`tests/unit/test_model_probe.py` 里那条 `live` 用例做同一件事，但两者都需要凭证，因此默认跳过、也不进每次 PR 的门禁。门禁里的 provider 覆盖仍然全部来自注入的 transport：它证明 adapter 会按方言文档解析，不证明某个 endpoint 真的说这套方言。换 provider、换网关或换 base URL 之后，请手工跑一次 `atlas model-check`。
 - **依赖供应链未审计**。版本已固定范围，但没有 SBOM，也没有做过依赖漏洞扫描。
 
 ## 结论

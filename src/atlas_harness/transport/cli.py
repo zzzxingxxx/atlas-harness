@@ -14,6 +14,7 @@ from atlas_harness import __version__
 from atlas_harness.agent.queues import QueueName, QueueRequest
 from atlas_harness.agent.service import AgentService
 from atlas_harness.config import Settings, load_settings
+from atlas_harness.evals import DEFAULT_DATASET_NAMES, datasets, render_report
 from atlas_harness.events import EventStore, EventType, SessionState
 from atlas_harness.evolution import (
     CandidateStatus,
@@ -23,6 +24,7 @@ from atlas_harness.evolution import (
     FeedbackItem,
     FeedbackKind,
     SkillCandidate,
+    run_datasets,
 )
 from atlas_harness.evolution.runner import SessionTaskRunner
 from atlas_harness.kernel.clock import SystemClock
@@ -35,6 +37,7 @@ from atlas_harness.kernel.errors import (
     EventLogCorruptionError,
     PolicyDeniedError,
     ProviderError,
+    ProviderTimeoutError,
     RecoveryError,
     ToolError,
     ToolInputError,
@@ -45,6 +48,7 @@ from atlas_harness.kernel.errors import (
 from atlas_harness.kernel.ids import new_id
 from atlas_harness.mcp.server import load_server_configs
 from atlas_harness.memory import MemoryLayer
+from atlas_harness.model.probe import DEFAULT_PROMPT, probe
 from atlas_harness.observability.audit import AUDIT_CATEGORIES, build_audit
 from atlas_harness.observability.export import build_bundle
 from atlas_harness.observability.logging import configure_logging
@@ -150,6 +154,48 @@ def doctor(
         for key, value in payload.items():
             if key != "status":
                 typer.echo(f"{key}: {value}")
+
+
+_PROBE_EXIT_CODES: dict[str, int] = {
+    "missing_api_key": ConfigurationError.exit_code,
+    "provider_timeout": ProviderTimeoutError.exit_code,
+}
+
+
+@app.command(name="model-check")
+def model_check(
+    ctx: typer.Context,
+    provider: str | None = typer.Option(
+        None, "--provider", help="Override ATLAS_MODEL_PROVIDER, e.g. deepseek."
+    ),
+    model: str | None = typer.Option(None, "--model", help="Override ATLAS_MODEL_NAME."),
+    prompt: str = typer.Option(DEFAULT_PROMPT, "--prompt", help="Prompt to send."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Send one real request to the configured provider and print the verdict.
+
+    This is the only command that needs the network, and the only way to find out
+    that a base URL, a key and a model name actually work together -- the offline
+    tests drive an injected transport, which cannot tell a wrong endpoint from a
+    right one. Nothing is written to the event log: a connectivity check is not a
+    session, and it must be safe to run against a data directory it does not own.
+
+    The API key never reaches the output. The report says whether one was
+    configured and nothing more, because this verdict is what gets pasted into a
+    ticket.
+    """
+
+    settings = _settings(ctx)
+    if provider is not None:
+        settings.model_provider = provider
+    if model is not None:
+        settings.model_name = model
+    report = probe(settings, prompt=prompt)
+    _emit(report.as_json(), json_output=json_output, lines=report.render())
+    if not report.ok:
+        raise typer.Exit(
+            code=_PROBE_EXIT_CODES.get(report.error_code or "", ProviderError.exit_code)
+        )
 
 
 def _state_summary(state: SessionState) -> dict[str, Any]:
@@ -1269,6 +1315,77 @@ def mcp_inspect(
     if payload["error"]:
         lines.append(f"error: {payload['error']}")
     _emit(payload, json_output=json_output, lines=lines)
+
+
+eval_app = typer.Typer(
+    name="eval",
+    help="Run the fixed evaluation task sets against the current configuration.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(eval_app)
+
+_DATASET_HELP = f"Datasets to run. Defaults to {' '.join(DEFAULT_DATASET_NAMES)}."
+
+
+@eval_app.command("run")
+def eval_run(
+    ctx: typer.Context,
+    dataset: list[str] | None = typer.Argument(None, help=_DATASET_HELP),
+    provider: str | None = typer.Option(
+        None, "--provider", help="Override ATLAS_MODEL_PROVIDER, e.g. fake."
+    ),
+    model: str | None = typer.Option(None, "--model", help="Override ATLAS_MODEL_NAME."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Run the fixed task sets and exit non-zero when any task fails.
+
+    This is the same measurement ``skill-evaluate`` runs, without a candidate: the
+    active skill library answers the tasks. The exit code is what a CI job reads, so
+    a failing task must never leave it at zero -- and an unknown dataset name is
+    refused rather than skipped, because a run over zero tasks would exit zero.
+    """
+
+    settings = _settings(ctx)
+    if provider is not None:
+        settings.model_provider = provider
+    if model is not None:
+        settings.model_name = model
+    names = list(dataset) if dataset else list(DEFAULT_DATASET_NAMES)
+    with _store(ctx) as store:
+        service = AgentService(settings=settings, store=store)
+        runner = SessionTaskRunner(service)
+        try:
+            report = run_datasets(runner, None, sets=datasets(names))
+        except AtlasError as error:
+            typer.echo(json.dumps(error.as_dict(), ensure_ascii=False), err=True)
+            raise typer.Exit(code=error.exit_code) from error
+        sessions = list(runner.sessions)
+    payload: dict[str, Any] = {
+        "provider": settings.model_provider,
+        "model": settings.model_name,
+        "datasets": [
+            {
+                "name": entry.name,
+                "task_count": entry.task_count,
+                "passed": entry.passed,
+                "failures": list(entry.failures),
+                "outcomes": [outcome.model_dump(mode="json") for outcome in entry.outcomes],
+            }
+            for entry in report.datasets
+        ],
+        "metrics": report.metrics.model_dump(mode="json"),
+        "task_count": report.task_count,
+        "failures": list(report.failures),
+        "passed": report.passed,
+        "sessions": sessions,
+    }
+    lines = [f"provider: {settings.model_provider}/{settings.model_name}"]
+    lines.extend(render_report(report))
+    lines.append(f"verdict: {'pass' if report.passed else 'fail'}")
+    _emit(payload, json_output=json_output, lines=lines)
+    if not report.passed:
+        raise typer.Exit(code=ToolError.exit_code)
 
 
 @app.command()

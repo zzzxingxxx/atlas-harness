@@ -51,6 +51,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "performance: scale checks that run at a milestone boundary rather than in the per-PR gate",
+    "live: sends a real request to a configured provider; skipped unless credentials are present",
 ]
 
 [tool.ruff]

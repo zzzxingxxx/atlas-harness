@@ -1,11 +1,10 @@
-"""HTTP server placeholder reserved for the M8 transport milestone."""
+"""HTTP entry point, kept as a thin wrapper over the transport layer.
 
-from __future__ import annotations
+The serving logic lives in :mod:`atlas_harness.transport.http` so that
+``python -m atlas_harness.transport.http`` and this wrapper cannot drift apart.
+"""
 
-
-def main() -> None:
-    raise SystemExit("HTTP server is planned for M8; use `atlas --help` for M0 commands.")
-
+from atlas_harness.transport.http import main
 
 if __name__ == "__main__":
     main()

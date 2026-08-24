@@ -63,6 +63,8 @@ atlas skill-promote <candidate-id> [--reason <text>] [--json]      # 只有评�
 atlas skill-rollback <skill-id> --to <version> [--reason <text>] [--json]
 atlas audit <session-id> [--category model|skill|tool|approval|truncation|compaction|recovery|mcp|subagent] [--json]
 atlas export <session-id> [--out <dir>] [--json]   # 写出四个观测台产物
+atlas eval run [<dataset>...] [--json]             # 跑固定任务集，失败时退出码 12
+atlas model-check [--provider <name>] [--model <name>] [--json]   # 唯一会走网络的命令，只验证连通性
 atlas mcp list [--json]                            # 只读配置，不连接任何服务器
 atlas mcp inspect <server> [--json]                # 连接一次，打印能力清单和被拒工具
 atlas verify [--session <id>] [--json]             # 只读一致性检查，退出码 0 / 1 / 8

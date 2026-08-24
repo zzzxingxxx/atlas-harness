@@ -19,10 +19,15 @@ Schema 版本 7，未变。M9 不新增事件类型，这是刻意的：一个�
 - `samples/`：七份冻结日志（schema v1 到 v7）加 `expected.json`。其中 `ses_release_demo` 是计划第 13 节要求的可回放 demo——一次审批、一次工具结果外置为 artifact、一次测试失败后修好。
 - `docs/runbook.md`、`docs/recovery.md`、`docs/security-review.md`：运行手册、故障恢复手册、安全审查记录。
 - `tests/performance/`：大日志、长 session、并发只读工具的规模检查，带 `performance` marker，按计划第 11.1 节在里程碑结束时运行而不进每次 PR 的门禁。
+- `atlas model-check`：对配置好的 provider 发一次真实请求并打印裁决。这是唯一需要网络的命令，也是唯一能分辨「base URL、key 和模型名三者能配合工作」的手段——注入 transport 的测试分不出对的 endpoint 和错的。不写任何事件：连通性检查不是一次会话，必须能安全地对不属于它的数据目录运行。密钥不进输出，报告只说配了没配。裁决即退出码：缺 key 2、超时 18、其他 provider 故障 17。
+- `atlas eval run [<dataset>...]`：跑固定任务集，任何任务失败就非零退出，给 CI 读。和 `skill-evaluate` 是同一套测量，只是没有候选——回答问题的是当前生效的 Skill 库。数据集名写错会被拒绝而不是跳过，否则一次跑零个任务的运行会退出 0。
+- `src/atlas_harness/model/probe.py` 与 `tests/unit/test_model_probe.py`：探测逻辑放在 model 层而不是 CLI 里，所以同一次往返既能由命令驱动，也能由带 `live` marker 的用例驱动。新增 `live` pytest marker，默认跳过，门禁保持离线自足。报告里的错误信息先按形状脱敏、再按**值**去掉这次实际用的 key——`redact` 只认识 `sk-`、`ghp_`、JWT 这类已知形状，而自建网关签发的 key 可以是任何形状并把它原样写进错误体，这一步覆盖的正是形状匹配覆盖不到的那一类。
 
 ### 测试
 
-新增 248 个用例，全部通过：`test_event_compat.py`（98）、`test_ops_verify.py`（22）、`test_ops_migrate.py`（13）、`test_ops_backup.py`（20）、`test_ops_checklist.py`（30）、`tests/replay/test_samples.py`（43）、`tests/integration/test_cli_ops.py`（22）。安全专项 `tests/security/` 达到 205 passed / 2 skipped（两项 skip 是 Windows 未开开发者模式无法建符号链接）。`tests/performance/` 9 项。
+新增 269 个用例：`test_event_compat.py`（98）、`test_ops_verify.py`（22）、`test_ops_migrate.py`（13）、`test_ops_backup.py`（20）、`test_ops_checklist.py`（30）、`tests/replay/test_samples.py`（43）、`tests/integration/test_cli_ops.py`（22）、`test_model_probe.py`（13 + 1 个 `live`）、`tests/integration/test_cli_eval.py`（7）。安全专项 `tests/security/` 达到 205 passed / 2 skipped（两项 skip 是 Windows 未开开发者模式无法建符号链接）。`tests/performance/` 9 项。
+
+门禁总计 1093 passed / 1 skipped（`tests/unit` + `tests/integration`）与 260 passed / 2 skipped（`tests/replay` + `tests/security`）。三项 skip 都是环境性的，不是被绕过的断言：一项缺凭证，两项缺 Windows 符号链接权限。
 
 ### 修复
 
@@ -30,7 +35,7 @@ Schema 版本 7，未变。M9 不新增事件类型，这是刻意的：一个�
 
 ### 已知限制
 
-见 `docs/security-review.md` 第 8 节。要点：HTTP 传输层无认证（默认绑 loopback）、工具执行无沙箱、未做渗透测试、OpenAI 兼容 adapter 未对真实 endpoint 发过请求、依赖供应链未审计。**内部试用可行，不适合处理生产凭证或暴露到不受信任的网络。**
+见 `docs/security-review.md` 第 8 节。要点：HTTP 传输层无认证（默认绑 loopback）、工具执行无沙箱、未做渗透测试、真实 provider 的行为不在自动化门禁内（`atlas model-check` 可按需验证，但需要凭证因而默认跳过）、依赖供应链未审计。**内部试用可行，不适合处理生产凭证或暴露到不受信任的网络。**
 
 ## 0.8.0 — MCP、子 Agent、HTTP 和观测台（M8）
 
