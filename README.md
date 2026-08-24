@@ -2,7 +2,7 @@
 
 AtlasHarness 是一个模型无关、工具可插拔、会话可恢复、能力可演化的 Agent Runtime。
 
-当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩，以及 M6 Memory、Skill 和来源追踪：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账，以及 Pending Window 反馈收集、候选 Skill 抽取与证据绑定、add/merge/reject 决策、固定 benchmark 与七项指标评测、champion 晋升和回滚。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M8-M9 里程碑逐步加入。
+当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩、M6 Memory、Skill 和来源追踪、M7 Pending Window 与受控自进化，以及 M8 MCP、子 Agent、HTTP 和观测台接口：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账，以及 Pending Window 反馈收集、候选 Skill 抽取与证据绑定、add/merge/reject 决策、固定 benchmark 与七项指标评测、champion 晋升和回滚，以及 MCP 服务器连接与工具翻译、每服务器的 scope/超时/并发/凭证隔离、子 Agent 任务合同与隔离执行、FastAPI 的 Session/Run/Abort/Resume/Compact/Events/Trace/Audit/Export/Skills 路由，和 trace.jsonl、audit.jsonl、metrics.json、replay-report.json 四个观测台产物。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M9 里程碑逐步加入。
 
 ## 环境
 
@@ -61,6 +61,11 @@ atlas skill-propose [--task <id>] [--skill <skill-id>] [--json]   # 从反馈生
 atlas skill-evaluate <candidate-id> [--json]                      # 跑固定 benchmark，记录七项指标
 atlas skill-promote <candidate-id> [--reason <text>] [--json]      # 只有评测通过的候选能晋升
 atlas skill-rollback <skill-id> --to <version> [--reason <text>] [--json]
+atlas audit <session-id> [--category model|skill|tool|approval|truncation|compaction|recovery|mcp|subagent] [--json]
+atlas export <session-id> [--out <dir>] [--json]   # 写出四个观测台产物
+atlas mcp list [--json]                            # 只读配置，不连接任何服务器
+atlas mcp inspect <server> [--json]                # 连接一次，打印能力清单和被拒工具
+python -m atlas_harness.transport.http             # FastAPI 入口，默认 127.0.0.1:8765
 ```
 
 所有命令失败时输出结构化错误（`{"error", "message", "details"}`）并使用固定退出码：配置 2、生命周期 3、预算 4、事件校验 5、事件存储 6、恢复 7、日志损坏 8、会话不存在 9、策略拒绝 10、审批拒绝 11、工具错误 12-16、取消 130。
@@ -368,5 +373,62 @@ uv run atlas skill-rollback <skill-id> --to 0.1.0
 ```
 
 `tests/unit/test_evolution.py` 和 `tests/integration/test_cli_evolution.py` 覆盖计划的四条测试条件：候选未评测前不会被默认注入、评测失败的候选不能晋升、晋升后可回滚到指定版本、新 Skill 不降低旧任务和安全任务集的成绩。集成测试里两个脚本化 Provider 的唯一区别是安全题的回答，所以门禁的两侧用同一套装置就能跑到。
+
+## MCP、子 Agent、HTTP 和观测台（M8）
+
+`schema_version` 在 M8 升到 7，新增 `mcp_server_connected`、`mcp_server_disconnected`、`mcp_tools_registered`、`subagent_task_started`、`subagent_task_finished`。读取端仍然接受版本 1 到 6。
+
+M8 加的是三个入口和一个出口，约束只有一条：**它们必须共用已有的 Registry、Policy 和 Trace，而不是各自再造一份。** 一个外部工具服务器、一个被委派的子任务和一次 HTTP 请求，如果各自带着自己的权限判断，那么「这次运行为什么被允许」就不再有单一答案。
+
+### MCP 工具是被翻译进来的，不是被信任进来的
+
+外部服务器声明的每个工具都要过一遍 `bridge_tools()` 才能进 Registry，被拒的理由来自一个封闭集合：`unnamed`、`invalid_name`、`name_collision`、`scope_not_granted`、`too_many_tools`、`duplicate`。
+
+- **名字被重写而不是被采纳**。`mcp_<server>_<tool>` 是唯一形式，两段都做规范化，所以外部工具永远不可能叫 `read_file`，也不可能盖住任何内置工具。规范化后工具那半为空（比如服务器提供了一个叫 `!!!` 的工具）会被判 `invalid_name`——否则它会退化成服务器的裸名字，两个不可命名的工具就会静默合成一个。
+- **scope 是交集，不是声明**。`_manifest_for()` 取 `spec.scopes & config.granted_scopes`。服务器要 `fs:write` 而配置只给了 `fs:read`，这个工具直接被拒，不是被降级。
+- **翻译完就是普通工具**。转成 `ToolManifest` 之后它走的是 `ToolExecutor.execute` 的同一条预检链：`registry.get` -> `tool.parse` -> `tool.policy_request` -> `policy.preflight`。`tests/security/test_mcp_policy.py` 要证明的就是这件事——一个恶意 MCP 工具无法绕过 Policy，因为它根本没有第二条通路可走。
+- **隔离写在配置里**。`granted_scopes`、`connect_timeout_ms`、`call_timeout_ms`、`max_tools`、`max_output_bytes`、`max_concurrent_calls`、`env` / `env_passthrough` 都是每服务器独立的，凭证默认不继承进程环境。`requires_approval` 默认为真。
+- **关闭先撤工具再写事件**。`shutdown` 的顺序是先 unbridge 再写 `mcp_server_disconnected`，所以不存在「日志说已断开但 Registry 里还留着它的工具」的窗口。
+
+`enable_mcp` 关的是**读取**而不只是连接：没启用时连配置文件都不读。但 `atlas mcp list` 走的是绕过这道门的服务，因为它必须能区分「配置了但没启用」和「什么都没配」——后者是这里唯一不能给出的错答案。
+
+### 子 Agent 的隔离是结构性的
+
+`SubagentTask` 是一个 frozen 模型，`allowed_tools`、`max_tokens`、`deadline_ms`、`return_format` 四项在孩子启动前就写进 `subagent_task_started`，所以一次运行可以拿它被给定的条款来评判，而不是拿 runner 当时恰好做了什么来评判。
+
+- **孩子拿不到父亲的可变对象**。它有自己的 session id、自己的 `QueueManager`、一个只含 `allowed_tools` 的 `ToolRegistry`，以及建在这个窄 Registry 上的 executor。父亲的队列和权限都不经过它，所以「孩子给父亲塞一条 steer 消息」没有代码路径。
+- **`allowed_tools` 必须显式给**。空元组意味着完全没有工具，这是个有用的契约（总结这段、判断那个）。继承父亲的整个 Registry 会让「委派」变成多绕一步的提权。
+- **契约只会被收窄**。`_clamped()` 用 `min()` 把 `max_tokens` 和 `deadline_ms` 压到运营者的上限，所以一份由模型写出来的契约无法给自己加预算。
+- **超时、预算耗尽和异常都收口到同一处**。`dispatch()` 的每条出路——包括 `raise`——都只写一个 `subagent_task_finished`；超时那条还会替孩子补一个 `operation_failed`，否则孩子的 session 会带着一个未关闭的 operation，在恢复看来那是一次需要人介入的崩溃。
+- **回来的是结果和证据，不是日志**。`evidence_refs` 指向孩子 session 里的 `tool_result` / `assistant_message` / `operation_failed`，父亲的日志不会因为委派而长出孩子那么大。Reducer 从不把孩子的事件折进父亲的投影。
+
+### HTTP 与 CLI 是同一层服务的两个入口
+
+`build_app()` 里的每个路由都只调用 `AgentService`、`SessionService`、`SkillRepository` 或 `build_bundle`，没有任何一条自己实现业务流程。
+
+```
+GET  /healthz                      GET  /sessions                 GET  /sessions/{id}
+GET  /sessions/{id}/events         POST /runs                     POST /sessions/{id}/run
+POST /sessions/{id}/abort          POST /sessions/{id}/resume     POST /sessions/{id}/compact
+GET  /sessions/{id}/trace          GET  /sessions/{id}/audit      GET  /sessions/{id}/export
+GET  /skills                       GET  /tools
+```
+
+- **错误体和 CLI 完全一致**，只多一个 `exit_code`：一个脚本对一半操作 shell out、对另一半发 POST 时，可以只判一个字段。
+- **恢复规则跨入口成立**。`resume` 还欠一个人工确认时返回 409 并列出待确认的 call，往一个 suspended session 上 `run` 也是 409——新工作不能把一个待决问题埋掉。409 而不是 500，是因为客户端不该重试进去。
+- **未知 session 是 404，不是空**。`read_events` 对不存在的 id 返回空列表，这对投影是对的，对路由是错的：打错一个字会得到一份干干净净的空 trace，而调用方会信它。
+- **每个请求单独开 store**，因为 SQLite 连接不是线程安全的。`http_host` 默认 loopback——这个传输层没有认证，绑到 `0.0.0.0` 等于把整个工作区交出去。
+
+### 四个产物回答的是问责问题
+
+`atlas export` 写出 `trace.jsonl`、`audit.jsonl`、`metrics.json`、`replay-report.json`，`GET /sessions/{id}/export` 返回同一个 bundle 的 JSON 形式。审计的九个类别就是计划里那七个问题加上 M8 的两个面：`model`、`skill`、`tool`、`approval`、`truncation`、`compaction`、`recovery`、`mcp`、`subagent`——一台外部工具服务器和一次委派任务同样需要事后归因。
+
+`replay-report.json` 的折叠是**非严格**的：这份报告恰恰是在日志看起来有损时才被人打开的，所以中间缺一个 seq 必须变成报告里的一处 `gaps`，而不是变成让报告写不出来的那个异常。完整日志两种折叠方式结果相同，因为那时每个 seq 都是期望的那个。被派出去却没有结果的任务同样进 `problems`——`open_subagent_task_ids` 只能意味着「还在跑」，绝不能意味着「runner 把它丢了」。
+
+### 三个入口由同一套回放验证
+
+计划的完成条件是 MCP、子 Agent 和 HTTP 入口都能被同一套回放测试验证，所以 `tests/replay/test_determinism.py` 底部把三者放进了同一个文件：一段含 MCP 握手和委派任务的日志要两次折出同一个 hash、丢掉索引后仍能重建、每个前缀都等于增量归约；而一次由 HTTP 驱动的运行读回来之后，`replay()` 的 hash 要等于 store 投影的 hash。
+
+`tests/integration/test_http_api.py` 用同样的方式证明「不重复业务逻辑」——它不去比对两个 handler 的代码，而是断言经 HTTP 跑出的事件序列和 `tests/integration/test_cli_agent.py` 断言的 CLI 序列逐项相同，且 trace / audit / export 三个响应体等于直接从这份日志构建出来的结果。两个入口产出一份日志，是这条要求唯一可观测的形式。
 
 后续工具沙箱和分布式执行功能以项目方案及开发计划为准。

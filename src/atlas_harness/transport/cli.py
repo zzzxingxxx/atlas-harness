@@ -42,7 +42,10 @@ from atlas_harness.kernel.errors import (
     ToolVersionError,
 )
 from atlas_harness.kernel.ids import new_id
+from atlas_harness.mcp.server import load_server_configs
 from atlas_harness.memory import MemoryLayer
+from atlas_harness.observability.audit import AUDIT_CATEGORIES, build_audit
+from atlas_harness.observability.export import build_bundle
 from atlas_harness.observability.logging import configure_logging
 from atlas_harness.observability.trace import build_trace
 from atlas_harness.policy import ApprovalGate, ApprovalMode, FixedApprovalGate, PolicyEngine
@@ -1174,6 +1177,141 @@ def trace(
     payload = rendered.model_dump(mode="json")
     payload["counts"] = rendered.counts()
     _emit(payload, json_output=json_output, lines=rendered.render() or ["no events"])
+
+
+mcp_app = typer.Typer(
+    name="mcp",
+    help="Inspect the configured MCP servers.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(mcp_app)
+
+
+def _mcp_service(ctx: typer.Context, store: EventStore) -> AgentService:
+    """Build a service whose MCP configs are read even when MCP is disabled.
+
+    ``atlas mcp list`` has to be able to say "configured but disabled". A service
+    built with the plain settings would report an empty list, which reads as "no
+    servers configured" and is the one answer an operator must not be given here.
+    """
+
+    settings = _settings(ctx)
+    configs = load_server_configs(settings.resolved_mcp_config_dir())
+    return AgentService(settings=settings, store=store, mcp_configs=configs)
+
+
+@mcp_app.command("list")
+def mcp_list(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """List the configured MCP servers without connecting to any of them."""
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        service = _mcp_service(ctx, store)
+        statuses = service.mcp_statuses()
+    payload: dict[str, Any] = {
+        "enabled": settings.enable_mcp,
+        "config_dir": str(settings.resolved_mcp_config_dir()),
+        "servers": [status.summary() for status in statuses],
+    }
+    lines = [f"config_dir: {payload['config_dir']}", f"enabled: {settings.enable_mcp}"]
+    if not statuses:
+        lines.append("no servers configured")
+    for status in statuses:
+        state = "connected" if status.connected else ("enabled" if status.enabled else "disabled")
+        lines.append(
+            f"{status.name:<20} {status.transport:<8} {state:<10} tools={len(status.tools)}"
+        )
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@mcp_app.command("inspect")
+def mcp_inspect(
+    ctx: typer.Context,
+    server: str = typer.Argument(..., help="Server name from the MCP config."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Print one server's capability manifest, tool list and refusals."""
+
+    with _store(ctx) as store:
+        service = _mcp_service(ctx, store)
+        payload = service.mcp.inspect(server)
+    config = payload["config"]
+    lines = [
+        f"server: {config['name']}",
+        f"transport: {config['transport']}",
+        f"address: {config.get('address') or 'n/a'}",
+        f"enabled: {config['enabled']}",
+        f"connected: {payload['connected']}",
+        f"protocol_version: {payload['protocol_version'] or 'unknown'}",
+        f"granted_scopes: {', '.join(config['granted_scopes']) or 'none'}",
+        f"capabilities: {', '.join(payload['capabilities']) or 'none'}",
+    ]
+    # Offered, bridged and refused are three different lists on purpose: a server
+    # can offer a tool that never became callable, and collapsing them would hide
+    # exactly the case an operator runs this command to see.
+    lines.extend(f"  offered {tool['name']} ({tool['risk']})" for tool in payload["offered"])
+    lines.extend(f"  bridged {name}" for name in payload["bridged"])
+    lines.extend(f"  refused {item['tool']}: {item['reason']}" for item in payload["rejected"])
+    if payload["error"]:
+        lines.append(f"error: {payload['error']}")
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command()
+def audit(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session to account for."),
+    category: str | None = typer.Option(
+        None, "--category", help=f"Limit to one of: {', '.join(AUDIT_CATEGORIES)}."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Answer the accountability questions for one session from its log."""
+
+    if category is not None and category not in AUDIT_CATEGORIES:
+        raise ConfigurationError(
+            "unknown audit category",
+            details={"category": category, "known": list(AUDIT_CATEGORIES)},
+        )
+    with _store(ctx) as store:
+        log = build_audit(store.read_events(session_id), session_id=session_id)
+    records = log.of_category(category) if category else log.records
+    payload: dict[str, Any] = {
+        "summary": log.summary(),
+        "records": [record.as_json() for record in records],
+    }
+    lines = [record.render() for record in records] or ["no auditable events"]
+    _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command()
+def export(
+    ctx: typer.Context,
+    session_id: str = typer.Argument(..., help="Session to export."),
+    out_dir: Path | None = typer.Option(
+        None, "--out", help="Directory to write the four artefacts into."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Write trace.jsonl, audit.jsonl, metrics.json and replay-report.json."""
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        bundle = build_bundle(store.read_events(session_id), session_id=session_id)
+    target = out_dir or (settings.resolved_data_dir() / "exports" / session_id)
+    written = bundle.write(target)
+    payload: dict[str, Any] = {
+        **bundle.summary(),
+        "written": {name: str(path) for name, path in written.items()},
+    }
+    lines = [f"session: {session_id}", f"directory: {target}"]
+    lines.extend(f"wrote {name}" for name in written)
+    lines.extend(bundle.replay.render())
+    _emit(payload, json_output=json_output, lines=lines)
 
 
 def main() -> None:

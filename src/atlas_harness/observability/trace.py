@@ -172,7 +172,55 @@ def _detail(event: Event) -> str:
             )
         case EventType.CAPABILITY_INJECTED:
             return _clip(_capability_detail(payload))
+        case EventType.MCP_SERVER_CONNECTED:
+            return _clip(
+                f"{payload.get('server')} via {payload.get('transport')} "
+                f"tools={payload.get('tool_count')} "
+                f"protocol={payload.get('protocol_version') or '-'}"
+            )
+        case EventType.MCP_SERVER_DISCONNECTED:
+            return _clip(
+                f"{payload.get('server')} reason={payload.get('reason')} "
+                f"after={payload.get('duration_ms') or 0}ms"
+            )
+        case EventType.MCP_TOOLS_REGISTERED:
+            return _clip(_mcp_tools_detail(payload))
+        case EventType.SUBAGENT_TASK_STARTED:
+            return _clip(
+                f"{payload.get('task_id')} -> {payload.get('child_session_id')} "
+                f"tools={payload.get('allowed_tools') or []} "
+                f"tokens={payload.get('max_tokens') or '-'} "
+                f"deadline={payload.get('deadline_ms') or '-'}ms"
+            )
+        case EventType.SUBAGENT_TASK_FINISHED:
+            return _clip(
+                f"{payload.get('task_id')} {payload.get('outcome')} "
+                f"tool_calls={payload.get('tool_calls')} "
+                f"tokens={payload.get('total_tokens')} "
+                f"in={payload.get('duration_ms') or 0}ms"
+            )
     return ""
+
+
+def _mcp_tools_detail(payload: dict[str, object]) -> str:
+    """Render a bridge registration as admitted names plus the reasons for the rest.
+
+    Rejections are counted by reason for the same purpose as the capability line:
+    a server offering a tool this runtime refuses to bridge is ordinary, and the
+    count is what an operator scans before reaching for ``atlas mcp inspect``.
+    """
+
+    admitted = payload.get("tools")
+    names = ", ".join(str(name) for name in admitted) if isinstance(admitted, list) else ""
+    detail = f"{payload.get('server')} registered={names or 'none'}"
+    reasons: dict[str, int] = {}
+    for item in _rows(payload.get("rejected")):
+        reason = str(item.get("reason") or "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+    if reasons:
+        counted = ", ".join(f"{reason}×{count}" for reason, count in sorted(reasons.items()))
+        detail = f"{detail} rejected={counted}"
+    return detail
 
 
 def _capability_detail(payload: dict[str, object]) -> str:

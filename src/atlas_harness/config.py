@@ -83,6 +83,38 @@ class Settings(BaseSettings):
     """Small on purpose. Recall improves with more candidates; the model's ability
     to act on them does not, and every one displaces conversation."""
 
+    mcp_config_dir: Path = Path(".atlas")
+    """Directory searched for ``mcp.yaml``/``mcp.yml``/``mcp.json``. Relative paths
+    resolve below the workspace root, so a project's servers travel with it."""
+
+    enable_mcp: bool = False
+    """Off by default. An MCP server is an external process with a tool list this
+    runtime did not write, so bringing one up has to be a deliberate act rather
+    than a consequence of a config file existing."""
+
+    enable_subagents: bool = False
+    """Off by default for the same reason as the loop's other spend limits: a
+    delegated task costs tokens the caller did not ask for one at a time."""
+
+    subagent_max_tokens: int = Field(default=20_000, gt=0)
+    subagent_deadline_ms: int = Field(default=120_000, gt=0)
+    """Ceiling for a task contract, not the contract itself. A task may ask for
+    less; asking for more is clamped, so a prompt cannot widen its own budget."""
+
+    http_host: str = "127.0.0.1"
+    """Loopback by default. The HTTP transport has no authentication of its own, so
+    a default that listened on every interface would publish a shell."""
+
+    http_port: int = Field(default=8765, gt=0, le=65_535)
+
+    def resolved_mcp_config_dir(self) -> Path:
+        """Resolve the MCP config directory below the workspace root when relative."""
+
+        config_dir = self.mcp_config_dir.expanduser()
+        if not config_dir.is_absolute():
+            config_dir = self.resolved_workspace_root() / config_dir
+        return config_dir.resolve()
+
     def resolved_skills_dir(self) -> Path:
         """Resolve the skill directory below the workspace root when relative."""
 

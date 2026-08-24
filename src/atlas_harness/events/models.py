@@ -12,11 +12,11 @@ from atlas_harness.kernel.ids import IdFactory
 
 DEFAULT_LANE = "main"
 
-CURRENT_SCHEMA_VERSION = 6
-"""Version written by this build. M7 added the feedback, candidate and champion events."""
+CURRENT_SCHEMA_VERSION = 7
+"""Version written by this build. M8 added the MCP server and sub-agent events."""
 
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6})
-"""Versions this build can read. v1-v5 logs from M1-M6 stay replayable."""
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
+"""Versions this build can read. v1-v6 logs from M1-M7 stay replayable."""
 
 
 class EventType(StrEnum):
@@ -55,6 +55,11 @@ class EventType(StrEnum):
     CANDIDATE_EVALUATED = "candidate_evaluated"
     CHAMPION_PROMOTED = "champion_promoted"
     CHAMPION_ROLLED_BACK = "champion_rolled_back"
+    MCP_SERVER_CONNECTED = "mcp_server_connected"
+    MCP_SERVER_DISCONNECTED = "mcp_server_disconnected"
+    MCP_TOOLS_REGISTERED = "mcp_tools_registered"
+    SUBAGENT_TASK_STARTED = "subagent_task_started"
+    SUBAGENT_TASK_FINISHED = "subagent_task_finished"
 
 
 TERMINAL_OPERATION_EVENTS = frozenset(
@@ -586,6 +591,108 @@ class ChampionRolledBack(Payload):
     evaluation_id: str | None = None
 
 
+MCP_TRANSPORTS = frozenset({"stdio", "http"})
+"""How a server is reached. Closed because the isolation argument differs per
+transport: a stdio server is a child process this runtime owns, an http one is a
+remote endpoint that has to clear the network policy first."""
+
+MCP_DISCONNECT_REASONS = frozenset({"shutdown", "timeout", "handshake_failed", "transport_error"})
+"""Why a connection ended. ``shutdown`` is the orderly close; the other three are
+failures, and keeping them apart is what lets an operator tell a server that was
+never reachable from one that stopped answering mid-session."""
+
+SUBAGENT_OUTCOMES = frozenset({"completed", "timeout", "budget_exceeded", "failed", "denied"})
+"""How a sub-agent task ended. ``denied`` covers a task refused before it ran --
+an allowed-tools set the parent cannot delegate, for instance -- which is not the
+same as one that ran and failed."""
+
+SUBAGENT_RETURN_FORMATS = frozenset({"text", "json"})
+"""What the parent asked the child to return. Declared per task rather than
+inferred from the answer, so a malformed reply is a task failure rather than a
+silently reinterpreted result."""
+
+
+class McpServerConnected(Payload):
+    """A configured MCP server completed its handshake.
+
+    The tool count and the capability list are recorded rather than derived at read
+    time: a server can change what it advertises between sessions, and an audit of
+    what the runtime *had* available must not depend on asking it again now.
+    """
+
+    server: str
+    transport: str = "stdio"
+    address: str | None = None
+    """Command line for stdio, base URL for http. Credentials never appear here."""
+    protocol_version: str | None = None
+    tool_count: int = 0
+    capabilities: list[str] = Field(default_factory=list)
+    connected_at_ms: int | None = None
+
+
+class McpServerDisconnected(Payload):
+    """A connection ended, orderly or otherwise."""
+
+    server: str
+    reason: str = "shutdown"
+    detail: str | None = None
+    duration_ms: int | None = None
+
+
+class McpToolsRegistered(Payload):
+    """External tools were admitted into the one registry, under vetted manifests.
+
+    ``rejected`` is as load-bearing as ``tools``: a server offering a tool this
+    runtime refuses to bridge is the ordinary case, not an error, and an operator
+    needs to see which name was dropped and why rather than wonder where it went.
+    """
+
+    server: str
+    tools: list[str] = Field(default_factory=list)
+    rejected: list[dict[str, Any]] = Field(default_factory=list)
+    granted_scopes: list[str] = Field(default_factory=list)
+    """Scopes the bridged manifests declare. The policy still enforces the grant;
+    this records what the bridge asked for so the two can be compared."""
+
+
+class SubagentTaskStarted(Payload):
+    """A child task was dispatched with an explicit, narrower contract.
+
+    Every limit is written down before the child runs. A sub-agent whose budget
+    was decided while it executed cannot be audited, and the parent's own limits
+    are not a contract the child agreed to.
+    """
+
+    task_id: str
+    child_session_id: str
+    objective: str = ""
+    allowed_tools: list[str] = Field(default_factory=list)
+    max_tokens: int | None = None
+    deadline_ms: int | None = None
+    return_format: str = "text"
+    parent_operation_id: str | None = None
+
+
+class SubagentTaskFinished(Payload):
+    """A child task ended, with its result and the evidence behind it.
+
+    ``evidence_refs`` points at the child's own events. The child's session is not
+    merged into the parent's, so this reference is the only durable link between a
+    returned answer and the work that produced it.
+    """
+
+    task_id: str
+    child_session_id: str
+    outcome: str = "completed"
+    result: str = ""
+    error: str | None = None
+    error_code: str | None = None
+    tool_calls: int = 0
+    total_tokens: int = 0
+    duration_ms: int | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+
+
 PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.SESSION_CREATED: SessionCreated,
     EventType.OPERATION_STARTED: OperationStarted,
@@ -622,6 +729,11 @@ PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.CANDIDATE_EVALUATED: CandidateEvaluated,
     EventType.CHAMPION_PROMOTED: ChampionPromoted,
     EventType.CHAMPION_ROLLED_BACK: ChampionRolledBack,
+    EventType.MCP_SERVER_CONNECTED: McpServerConnected,
+    EventType.MCP_SERVER_DISCONNECTED: McpServerDisconnected,
+    EventType.MCP_TOOLS_REGISTERED: McpToolsRegistered,
+    EventType.SUBAGENT_TASK_STARTED: SubagentTaskStarted,
+    EventType.SUBAGENT_TASK_FINISHED: SubagentTaskFinished,
 }
 
 

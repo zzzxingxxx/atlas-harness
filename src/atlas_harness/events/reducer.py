@@ -240,6 +240,40 @@ class SessionState(BaseModel):
     """``skill_id@version`` per rollback, in order, so a replay can say how often a
     skill has had to be walked back rather than only where it ended up."""
 
+    mcp_servers: dict[str, str] = Field(default_factory=dict)
+    """Server name -> ``connected`` or the reason it disconnected. One slot per
+    server rather than a list of transitions: what an audit asks is whether a tool
+    came from a server that was actually reachable, and the disconnect reason is
+    the part that answers it."""
+
+    mcp_tools: dict[str, list[str]] = Field(default_factory=dict)
+    """Server name -> the bridged tool names it contributed. This is what makes a
+    tool call attributable: a bare ``tool_started`` names the tool, and only this
+    mapping says whether that tool was builtin or came in from outside."""
+
+    subagent_task_ids: list[str] = Field(default_factory=list)
+    """Child tasks dispatched from this session, in order."""
+
+    subagent_sessions: dict[str, str] = Field(default_factory=dict)
+    """Task id -> the child's own session id. The child's events are never folded
+    into this projection, so this pointer is the only way back to them."""
+
+    subagent_outcomes: dict[str, str] = Field(default_factory=dict)
+    """Task id -> how it ended. A task id in ``subagent_task_ids`` with no entry here
+    was dispatched and never came back, which is exactly the state a crash leaves."""
+
+    @property
+    def open_subagent_task_ids(self) -> list[str]:
+        """Dispatched and never resolved. Non-empty means resources may still be held."""
+
+        return [
+            task_id for task_id in self.subagent_task_ids if task_id not in self.subagent_outcomes
+        ]
+
+    @property
+    def connected_mcp_servers(self) -> list[str]:
+        return [name for name, status in self.mcp_servers.items() if status == "connected"]
+
     @property
     def evaluated_candidate_ids(self) -> list[str]:
         """Candidates that were actually measured, in proposal order."""
@@ -499,6 +533,27 @@ class Reducer:
             to_version = str(payload["to_version"])
             state.promoted_versions[skill_id] = to_version
             state.rollbacks.append(f"{skill_id}@{to_version}")
+        elif event.event_type is EventType.MCP_SERVER_CONNECTED:
+            state.mcp_servers[str(payload["server"])] = "connected"
+        elif event.event_type is EventType.MCP_SERVER_DISCONNECTED:
+            state.mcp_servers[str(payload["server"])] = str(payload.get("reason") or "shutdown")
+        elif event.event_type is EventType.MCP_TOOLS_REGISTERED:
+            state.mcp_tools[str(payload["server"])] = [
+                str(name) for name in payload.get("tools") or []
+            ]
+        elif event.event_type is EventType.SUBAGENT_TASK_STARTED:
+            task_id = str(payload["task_id"])
+            if task_id not in state.subagent_task_ids:
+                state.subagent_task_ids.append(task_id)
+            state.subagent_sessions[task_id] = str(payload.get("child_session_id") or "")
+        elif event.event_type is EventType.SUBAGENT_TASK_FINISHED:
+            task_id = str(payload["task_id"])
+            if task_id not in state.subagent_task_ids:
+                # A finish with no start means the log lost its dispatch event, and
+                # dropping the outcome would make the task invisible rather than
+                # visibly incomplete.
+                state.subagent_task_ids.append(task_id)
+            state.subagent_outcomes[task_id] = str(payload.get("outcome") or "completed")
 
     def _apply_operation_event(
         self, operation: OperationState, event: Event, payload: dict[str, Any]
