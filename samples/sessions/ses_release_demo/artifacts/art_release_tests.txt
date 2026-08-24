@@ -1,0 +1,138 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.4, pytest-8.3.2
+rootdir: /workspace/atlas-demo
+collected 1 item
+
+tests/unit/test_totals.py F                                              [100%]
+
+=================================== FAILURES ===================================
+_________________________________ test_total __________________________________
+
+    def test_total() -> None:
+>       assert total([20, 22]) == 42
+E       assert 41 == 42
+
+tests/unit/test_totals.py:6: AssertionError
+---- captured log line 1 ----
+---- captured log line 2 ----
+---- captured log line 3 ----
+---- captured log line 4 ----
+---- captured log line 5 ----
+---- captured log line 6 ----
+---- captured log line 7 ----
+---- captured log line 8 ----
+---- captured log line 9 ----
+---- captured log line 10 ----
+---- captured log line 11 ----
+---- captured log line 12 ----
+---- captured log line 13 ----
+---- captured log line 14 ----
+---- captured log line 15 ----
+---- captured log line 16 ----
+---- captured log line 17 ----
+---- captured log line 18 ----
+---- captured log line 19 ----
+---- captured log line 20 ----
+---- captured log line 21 ----
+---- captured log line 22 ----
+---- captured log line 23 ----
+---- captured log line 24 ----
+---- captured log line 25 ----
+---- captured log line 26 ----
+---- captured log line 27 ----
+---- captured log line 28 ----
+---- captured log line 29 ----
+---- captured log line 30 ----
+---- captured log line 31 ----
+---- captured log line 32 ----
+---- captured log line 33 ----
+---- captured log line 34 ----
+---- captured log line 35 ----
+---- captured log line 36 ----
+---- captured log line 37 ----
+---- captured log line 38 ----
+---- captured log line 39 ----
+---- captured log line 40 ----
+---- captured log line 41 ----
+---- captured log line 42 ----
+---- captured log line 43 ----
+---- captured log line 44 ----
+---- captured log line 45 ----
+---- captured log line 46 ----
+---- captured log line 47 ----
+---- captured log line 48 ----
+---- captured log line 49 ----
+---- captured log line 50 ----
+---- captured log line 51 ----
+---- captured log line 52 ----
+---- captured log line 53 ----
+---- captured log line 54 ----
+---- captured log line 55 ----
+---- captured log line 56 ----
+---- captured log line 57 ----
+---- captured log line 58 ----
+---- captured log line 59 ----
+---- captured log line 60 ----
+---- captured log line 61 ----
+---- captured log line 62 ----
+---- captured log line 63 ----
+---- captured log line 64 ----
+---- captured log line 65 ----
+---- captured log line 66 ----
+---- captured log line 67 ----
+---- captured log line 68 ----
+---- captured log line 69 ----
+---- captured log line 70 ----
+---- captured log line 71 ----
+---- captured log line 72 ----
+---- captured log line 73 ----
+---- captured log line 74 ----
+---- captured log line 75 ----
+---- captured log line 76 ----
+---- captured log line 77 ----
+---- captured log line 78 ----
+---- captured log line 79 ----
+---- captured log line 80 ----
+---- captured log line 81 ----
+---- captured log line 82 ----
+---- captured log line 83 ----
+---- captured log line 84 ----
+---- captured log line 85 ----
+---- captured log line 86 ----
+---- captured log line 87 ----
+---- captured log line 88 ----
+---- captured log line 89 ----
+---- captured log line 90 ----
+---- captured log line 91 ----
+---- captured log line 92 ----
+---- captured log line 93 ----
+---- captured log line 94 ----
+---- captured log line 95 ----
+---- captured log line 96 ----
+---- captured log line 97 ----
+---- captured log line 98 ----
+---- captured log line 99 ----
+---- captured log line 100 ----
+---- captured log line 101 ----
+---- captured log line 102 ----
+---- captured log line 103 ----
+---- captured log line 104 ----
+---- captured log line 105 ----
+---- captured log line 106 ----
+---- captured log line 107 ----
+---- captured log line 108 ----
+---- captured log line 109 ----
+---- captured log line 110 ----
+---- captured log line 111 ----
+---- captured log line 112 ----
+---- captured log line 113 ----
+---- captured log line 114 ----
+---- captured log line 115 ----
+---- captured log line 116 ----
+---- captured log line 117 ----
+---- captured log line 118 ----
+---- captured log line 119 ----
+---- captured log line 120 ----
+=========================== short test summary info ============================
+FAILED tests/unit/test_totals.py::test_total - assert 41 == 42
+============================== 1 failed in 0.11s ===============================

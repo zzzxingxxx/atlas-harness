@@ -1,0 +1,48 @@
+{
+  "current_schema_version": 7,
+  "note": "Frozen. Regenerating these hashes instead of fixing the code would delete the backward-compatibility guarantee they exist to prove.",
+  "sessions": {
+    "ses_release_demo": {
+      "events": 23,
+      "last_seq": 23,
+      "schema_version": 7,
+      "state_hash": "6e23e76b824b093d71e0da41c1bd42a620d0b17fdb853a146f5e6119b5dfbdbf"
+    },
+    "ses_schema_v1": {
+      "events": 5,
+      "last_seq": 5,
+      "schema_version": 1,
+      "state_hash": "beb74f4bc4669eacc84bc79f1b42bfa57b670e564d4cda0bfa30475feb0a1612"
+    },
+    "ses_schema_v2": {
+      "events": 5,
+      "last_seq": 5,
+      "schema_version": 2,
+      "state_hash": "eadafc49f7eae3f3b0b12de055da6384eba5c710dad578afbada37872d6aa2d7"
+    },
+    "ses_schema_v3": {
+      "events": 6,
+      "last_seq": 6,
+      "schema_version": 3,
+      "state_hash": "c7fb6ae27cbe7da534f855092e9faa82cb713aa7c06d5de62c1c443bd3ff41ea"
+    },
+    "ses_schema_v4": {
+      "events": 5,
+      "last_seq": 5,
+      "schema_version": 4,
+      "state_hash": "b30a4551bd8c048f0420cd0e65c15ef0a6a25a99c9aa974bf950f4de732bd434"
+    },
+    "ses_schema_v5": {
+      "events": 6,
+      "last_seq": 6,
+      "schema_version": 5,
+      "state_hash": "74ed2caf790ac6448c64c15466ea3b233048303a5ad94f17eaa07c285a4c1de5"
+    },
+    "ses_schema_v6": {
+      "events": 7,
+      "last_seq": 7,
+      "schema_version": 6,
+      "state_hash": "c05dd0744db6d738a5e9421e86ed6eb93e87c9a7a25ba7cc15e3611fa8683f19"
+    }
+  }
+}

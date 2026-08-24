@@ -13,3 +13,4 @@ build/
 .atlas/
 .env
 !.env.example
+samples/index.sqlite3*

@@ -32,6 +32,7 @@ from atlas_harness.kernel.errors import (
     BudgetExceededError,
     CancellationError,
     ConfigurationError,
+    EventLogCorruptionError,
     PolicyDeniedError,
     ProviderError,
     RecoveryError,
@@ -48,6 +49,15 @@ from atlas_harness.observability.audit import AUDIT_CATEGORIES, build_audit
 from atlas_harness.observability.export import build_bundle
 from atlas_harness.observability.logging import configure_logging
 from atlas_harness.observability.trace import build_trace
+from atlas_harness.ops import (
+    create_backup,
+    rebuild_index,
+    rebuild_index_at,
+    restore_backup,
+    run_release_checks,
+    verify_backup,
+    verify_data_dir,
+)
 from atlas_harness.policy import ApprovalGate, ApprovalMode, FixedApprovalGate, PolicyEngine
 from atlas_harness.session.branches import BranchService
 from atlas_harness.session.recovery import RecoveryPlan
@@ -1312,6 +1322,145 @@ def export(
     lines.extend(f"wrote {name}" for name in written)
     lines.extend(bundle.replay.render())
     _emit(payload, json_output=json_output, lines=lines)
+
+
+@app.command()
+def verify(
+    ctx: typer.Context,
+    session_id: str | None = typer.Option(None, "--session", help="Verify one session only."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Check logs, index rows and artifacts against each other, changing nothing.
+
+    The exit code is the operator's instruction rather than a mere pass or fail: 0
+    means nothing is wrong, 1 means derived state drifted and ``atlas reindex``
+    repairs it, and 8 means the log itself is damaged and only a restore will do.
+    """
+
+    with _store(ctx) as store:
+        report = verify_data_dir(store, sessions=[session_id] if session_id else None)
+    _emit(report.as_json(), json_output=json_output, lines=report.render())
+    if report.ok:
+        return
+    raise typer.Exit(code=1 if report.repairable else EventLogCorruptionError.exit_code)
+
+
+@app.command()
+def reindex(
+    ctx: typer.Context,
+    session_id: str | None = typer.Option(None, "--session", help="Rebuild one session only."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Rebuild the SQLite index from the logs, which are the only source of truth."""
+
+    with _store(ctx) as store:
+        report = rebuild_index(store, sessions=[session_id] if session_id else None)
+    _emit(report.as_json(), json_output=json_output, lines=report.render())
+    if not report.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def backup(
+    ctx: typer.Context,
+    out_dir: Path | None = typer.Option(None, "--out", help="Directory to write the backup into."),
+    session_id: str | None = typer.Option(None, "--session", help="Back up one session only."),
+    no_index: bool = typer.Option(False, "--no-index", help="Skip the SQLite index snapshot."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Copy logs, artifacts and the index somewhere safe, then verify the copy.
+
+    The verification runs here instead of being left to the operator because a
+    backup nobody has checked is only a belief that a backup exists.
+    """
+
+    settings = _settings(ctx)
+    target = out_dir or (
+        settings.resolved_data_dir() / "backups" / f"backup-{SystemClock().now_ms()}"
+    )
+    with _store(ctx) as store:
+        manifest = create_backup(
+            store,
+            target,
+            sessions=[session_id] if session_id else None,
+            include_index=not no_index,
+        )
+    verification = verify_backup(target)
+    payload: dict[str, Any] = {
+        "directory": str(target),
+        "manifest": manifest.as_json(),
+        "verification": verification.as_json(),
+    }
+    _emit(payload, json_output=json_output, lines=[*manifest.render(), *verification.render()])
+    if not verification.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command(name="backup-check")
+def backup_check(
+    source: Path = typer.Argument(..., help="Backup directory to re-hash."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Re-hash a stored backup, so it can be checked long before it is needed."""
+
+    verification = verify_backup(source)
+    _emit(verification.as_json(), json_output=json_output, lines=verification.render())
+    if not verification.ok:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def restore(
+    ctx: typer.Context,
+    source: Path = typer.Argument(..., help="Backup directory to restore from."),
+    target: Path | None = typer.Option(None, "--target", help="Data directory to write into."),
+    force: bool = typer.Option(False, "--force", help="Allow restoring into a non-empty target."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Restore a verified backup and prove the restored logs still fold the same.
+
+    Exits non-zero when a restored log folds to a different state hash than it did
+    when it was backed up. The bytes were already proven identical by the checksum,
+    so that can only mean this build reads that log differently, which is the
+    backward-compatibility break the release gate exists to catch.
+    """
+
+    settings = _settings(ctx)
+    landing = target or settings.resolved_data_dir()
+    report = restore_backup(source, landing, force=force)
+    lines = list(report.render())
+    payload: dict[str, Any] = {"restore": report.as_json()}
+    if not report.index_restored:
+        # A restore with no index in the backup leaves a directory nothing can serve
+        # from, so the rebuild happens here rather than as advice in a runbook.
+        rebuilt = rebuild_index_at(landing)
+        lines.extend(rebuilt.render())
+        payload["reindex"] = rebuilt.as_json()
+    _emit(payload, json_output=json_output, lines=lines)
+    if not report.compatible:
+        raise typer.Exit(code=1)
+
+
+@app.command(name="release-check")
+def release_check(
+    ctx: typer.Context,
+    samples_dir: Path = typer.Option(
+        Path("samples"), "--samples", help="Directory of frozen replay samples."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable output."),
+) -> None:
+    """Run the release checklist against a real data directory and print the verdict."""
+
+    settings = _settings(ctx)
+    with _store(ctx) as store:
+        report = run_release_checks(
+            store,
+            samples_dir=samples_dir,
+            workspace_root=settings.resolved_workspace_root(),
+        )
+    _emit(report.as_json(), json_output=json_output, lines=report.render())
+    if not report.ok:
+        raise typer.Exit(code=1)
 
 
 def main() -> None:

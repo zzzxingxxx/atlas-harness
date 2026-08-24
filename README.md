@@ -2,7 +2,7 @@
 
 AtlasHarness 是一个模型无关、工具可插拔、会话可恢复、能力可演化的 Agent Runtime。
 
-当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩、M6 Memory、Skill 和来源追踪、M7 Pending Window 与受控自进化，以及 M8 MCP、子 Agent、HTTP 和观测台接口：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账，以及 Pending Window 反馈收集、候选 Skill 抽取与证据绑定、add/merge/reject 决策、固定 benchmark 与七项指标评测、champion 晋升和回滚，以及 MCP 服务器连接与工具翻译、每服务器的 scope/超时/并发/凭证隔离、子 Agent 任务合同与隔离执行、FastAPI 的 Session/Run/Abort/Resume/Compact/Events/Trace/Audit/Export/Skills 路由，和 trace.jsonl、audit.jsonl、metrics.json、replay-report.json 四个观测台产物。后续功能模块会按照 [Python 开发计划](./agent-harness-python-development-plan.md) 的 M9 里程碑逐步加入。
+当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩、M6 Memory、Skill 和来源追踪、M7 Pending Window 与受控自进化，M8 MCP、子 Agent、HTTP 和观测台接口，以及 M9 稳定性、安全和发布：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账，以及 Pending Window 反馈收集、候选 Skill 抽取与证据绑定、add/merge/reject 决策、固定 benchmark 与七项指标评测、champion 晋升和回滚，以及 MCP 服务器连接与工具翻译、每服务器的 scope/超时/并发/凭证隔离、子 Agent 任务合同与隔离执行、FastAPI 的 Session/Run/Abort/Resume/Compact/Events/Trace/Audit/Export/Skills 路由，和 trace.jsonl、audit.jsonl、metrics.json、replay-report.json 四个观测台产物，以及 M9 冻结的事件 schema 兼容性策略、verify/reindex/backup/backup-check/restore/release-check 六条运维命令、逐版本冻结的可回放样例日志、十项发布检查与八项风险的监控/暂停/回滚动作，和运行、故障恢复与安全审查三份手册。[Python 开发计划](./agent-harness-python-development-plan.md) 的 M0 到 M9 已全部实现。
 
 ## 环境
 
@@ -65,6 +65,12 @@ atlas audit <session-id> [--category model|skill|tool|approval|truncation|compac
 atlas export <session-id> [--out <dir>] [--json]   # 写出四个观测台产物
 atlas mcp list [--json]                            # 只读配置，不连接任何服务器
 atlas mcp inspect <server> [--json]                # 连接一次，打印能力清单和被拒工具
+atlas verify [--session <id>] [--json]             # 只读一致性检查，退出码 0 / 1 / 8
+atlas reindex [--session <id>] [--json]            # 从日志重建 SQLite 索引
+atlas backup [--out <dir>] [--session <id>] [--no-index] [--json]
+atlas backup-check <backup-dir> [--json]           # 离线重新哈希，不需要数据目录
+atlas restore <backup-dir> [--target <dir>] [--force] [--json]
+atlas release-check [--samples samples] [--json]   # 十项发布检查加风险登记表
 python -m atlas_harness.transport.http             # FastAPI 入口，默认 127.0.0.1:8765
 ```
 
@@ -430,5 +436,51 @@ GET  /skills                       GET  /tools
 计划的完成条件是 MCP、子 Agent 和 HTTP 入口都能被同一套回放测试验证，所以 `tests/replay/test_determinism.py` 底部把三者放进了同一个文件：一段含 MCP 握手和委派任务的日志要两次折出同一个 hash、丢掉索引后仍能重建、每个前缀都等于增量归约；而一次由 HTTP 驱动的运行读回来之后，`replay()` 的 hash 要等于 store 投影的 hash。
 
 `tests/integration/test_http_api.py` 用同样的方式证明「不重复业务逻辑」——它不去比对两个 handler 的代码，而是断言经 HTTP 跑出的事件序列和 `tests/integration/test_cli_agent.py` 断言的 CLI 序列逐项相同，且 trace / audit / export 三个响应体等于直接从这份日志构建出来的结果。两个入口产出一份日志，是这条要求唯一可观测的形式。
+
+## 稳定性、安全和发布（M9）
+
+`schema_version` 仍然是 7，M9 不新增任何事件类型。这是刻意的：一个以稳定性为目标的里程碑如果自己改了数据合同，它交付的正是它要消除的风险。M9 加的东西不改变运行时行为，它把「这套东西现在能不能交给别人用」变成一个可以由命令回答的问题。
+
+### 兼容性承诺写成数据，而不是 README 里的一段话
+
+`src/atlas_harness/events/compat.py` 把 schema 版本历史和五条兼容性规则写成可查询的结构：新版本可以新增事件类型且已有类型含义不变、已有 payload 上的新字段必须带默认值、reducer 读的字段永不改名或移除、未知键被保留而不是被拒绝、不支持的 `schema_version` 在解析时被拒而不是被静默折叠。
+
+所以 `SUPPORTED_SCHEMA_VERSIONS` 只增不减，任何受支持版本写下的日志在今天的构建上原样可读——**没有需要改写的旧日志，因为改写一份日志会摧毁它作为证据的全部价值**。README、发布检查和测试引用的是同一个来源，不是三份会各自漂移的转述。
+
+`samples/` 里每个受支持版本一份冻结日志，加一份记录了 state hash 的 `expected.json`，`tests/replay/test_samples.py` 断言它们今天仍折出同一个结果。这项断言会因为一次**有意的**改动而失败，那正是它的用途：失败意味着向后兼容被破坏了，修法是解释这个改动，永远不是重新生成 hash。
+
+### 退出码就是操作指令
+
+| `atlas verify` 退出码 | 含义 | 动作 |
+|---|---|---|
+| 0 | 日志、索引、artifact 三者一致 | 无 |
+| 1 | 只有派生状态漂移 | `atlas reindex` |
+| 8 | 日志本身有损（seq 缺失、行不可解析、session id 不符） | 从备份恢复 |
+
+- **区分 1 和 8 是这个命令存在的理由。** 索引永远可以从日志重建，所以 1 不是事故；日志缺一条事件没有任何工具能凭空补回来，所以 8 是事故。`reindex` 会正确地拒绝一份读不出来的日志（报 `skipped` 并让整条命令退出 1），因为从损坏的源重建派生状态只会得到一份看起来完整的假数据。
+- **`reindex` 是这个运行时唯一的「迁移」。** 每个 session 的重建是一个 `BEGIN IMMEDIATE` 事务，先删旧行再插日志里的行，所以中途崩溃留下的索引要么整体是旧的、要么整体是新的，绝不会是两段历史的混合。
+- **`backup` 立刻重新校验自己写出的副本。** 没有被校验过的备份只是一个「存在备份」的信念，所以这一步不留给操作者。清单 `backup-manifest.json` **最后**写入，因此被打断的备份是可识别地不完整，而不是可恢复地错误。`backup-check` 不需要数据目录，可以在离线备份卷上定时重新哈希——而不是只在需要恢复的那天才第一次发现备份是坏的。
+- **`restore` 证明恢复出来的日志在今天的构建上仍折出备份时记录的同一个 state hash。** 字节正确但 hash 变了会报 `incompatible`，那是兼容性告警而不是数据损坏，正确处理是先回滚构建。恢复进非空目录需要 `--force`，因为同一个 session id 的两段历史绝不能意外交错。
+
+### 发布检查是算出来的，不是勾出来的
+
+`atlas release-check --samples samples` 跑十项检查——`schema_policy`、`data_dir_verified`、`backup_round_trip`、`sample_replay`、`schema_coverage`、`demo_session`、`no_secrets_in_output`、`side_effect_tools_gated`、`policy_denies_the_obvious`、`risk_register`——再加上计划第 15 节八项风险各自的监控、暂停和回滚动作。它**只读**，否则它就会是一个没人敢对生产环境运行的工具，而生产环境正是它有意义的地方。
+
+- `demo_session` 要求样例里真有计划第 13 节点名的那三件事：一次审批、一次工具结果被外置为 artifact、一次测试失败后继续修好。
+- `no_secrets_in_output` 报告**位置而不是内容**，因为这项检查自己的输出也会被打印和归档。
+- `risk_register` 里每条动作引用的文件路径都由 `tests/unit/test_ops_checklist.py` 校验存在——一个指向已删除模块的控制项是意图，不是控制。
+
+### 手册按症状索引，安全记录列出边界
+
+- [运行手册](docs/runbook.md)：环境、每日巡检、备份、重建派生状态、恢复、发布前和例行节奏，每节给出一条可以照抄的命令和一个可以据此下判断的退出码。
+- [故障恢复手册](docs/recovery.md)：按症状索引的九个场景，每节的结构都是「你看到了什么 → 它意味着什么 → 做什么 → 怎么确认修好了」。
+- [安全审查记录](docs/security-review.md)：路径、命令、Prompt Injection、Skill Poisoning、MCP 越权、敏感信息落盘和事件完整性七个专项，每项列出在哪里判定、用什么证明，**以及已知的边界**。最后一栏是关键——一份只列「已覆盖」的安全记录会让读它的人高估防护范围，而高估比空白更危险。
+- [变更记录](CHANGELOG.md)：版本号形式为 `0.M.0`，每个版本一节 schema 说明。
+
+安全记录的结论是明确的：**内部试用可以进行，不适合处理生产凭证或暴露到不受信任的网络。** HTTP 传输层没有认证（默认绑 loopback）、工具执行没有沙箱、没做过渗透测试、OpenAI 兼容 adapter 未对真实 endpoint 发过请求、依赖供应链未审计——这些都是接受而非缓解，写在第 8 节里以免被读成已覆盖。
+
+### 规模检查在里程碑边界跑，不进每次 PR 的门禁
+
+`tests/performance/` 带 `performance` marker，按计划第 11.1 节在里程碑结束时运行：大日志的折叠是线性而不是二次的、可以流式读而不必整份持有、丢掉索引后仍折出同一个 hash；长 session 跨多个 lane 仍然只有一份日志，压缩换掉的是 prompt 而不是记录，所以折叠结果不变；48 个并发只读调用留下的日志无缺口，2 MB 的工具输出在进日志之前就被截断。
 
 后续工具沙箱和分布式执行功能以项目方案及开发计划为准。

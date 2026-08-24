@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atlas-harness"
-version = "0.1.0"
+version = "0.9.0"
 description = "A recoverable, governable and evolvable Agent Runtime."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -49,6 +49,9 @@ packages = ["src/atlas_harness"]
 addopts = "-ra"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "performance: scale checks that run at a milestone boundary rather than in the per-PR gate",
+]
 
 [tool.ruff]
 line-length = 100
