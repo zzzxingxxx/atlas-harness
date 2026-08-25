@@ -150,6 +150,12 @@ SCHEMA_HISTORY: tuple[SchemaVersionRecord, ...] = (
             EventType.SUBAGENT_TASK_FINISHED,
         ),
     ),
+    SchemaVersionRecord(
+        version=8,
+        milestone="M10",
+        summary="intent classification recorded as a signal, never as a decision",
+        added_events=(EventType.INTENT_CLASSIFIED,),
+    ),
 )
 """Frozen, append-only. An entry is never edited after its milestone ships --
 that is the whole point of writing the history down instead of deriving it."""

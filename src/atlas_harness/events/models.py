@@ -12,11 +12,11 @@ from atlas_harness.kernel.ids import IdFactory
 
 DEFAULT_LANE = "main"
 
-CURRENT_SCHEMA_VERSION = 7
-"""Version written by this build. M8 added the MCP server and sub-agent events."""
+CURRENT_SCHEMA_VERSION = 8
+"""Version written by this build. M10 added the recorded intent classification."""
 
-SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7})
-"""Versions this build can read. v1-v6 logs from M1-M7 stay replayable."""
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8})
+"""Versions this build can read. v1-v7 logs from M1-M9 stay replayable."""
 
 
 class EventType(StrEnum):
@@ -60,6 +60,7 @@ class EventType(StrEnum):
     MCP_TOOLS_REGISTERED = "mcp_tools_registered"
     SUBAGENT_TASK_STARTED = "subagent_task_started"
     SUBAGENT_TASK_FINISHED = "subagent_task_finished"
+    INTENT_CLASSIFIED = "intent_classified"
 
 
 TERMINAL_OPERATION_EVENTS = frozenset(
@@ -693,6 +694,66 @@ class SubagentTaskFinished(Payload):
     evidence_refs: list[str] = Field(default_factory=list)
 
 
+class IntentCandidateRecord(Payload):
+    """One label a classifier scored, attributed to the classifier that scored it.
+
+    The attribution is what makes a fused conclusion auditable: two routes agreeing
+    and one route deciding alone produce the same winning label, and only the
+    per-classifier rows tell them apart.
+    """
+
+    label: str
+    score: float = 0.0
+    classifier: str = ""
+
+
+class IntentClassified(Payload):
+    """A recorded intent signal for one user input.
+
+    Written whether or not the classification reached a usable conclusion. An
+    abstention is the ordinary case rather than an error, and a log that only kept
+    the confident answers could not say how often the taxonomy fails to cover what
+    users actually ask -- which is the question the signal exists to answer.
+
+    ``classifiers_abstained`` is kept apart from ``degraded`` on purpose. A route
+    that ran and found its evidence too thin is not a route that failed to run, and
+    collapsing the two would make ordinary short inputs look like a broken runtime.
+    """
+
+    query: str
+    intent: str
+    taxonomy_version: str
+    query_hash: str = ""
+    """Stable hash of the input, so a replay can assert the record it read belongs
+    to the input being replayed rather than trusting position in the log."""
+
+    confidence: float = 0.0
+    margin: float = 0.0
+    """First place minus second place. Recorded separately from ``candidates``
+    because agreement drives ``confidence`` to 1.0 and says nothing; the margin is
+    what shows two labels could not be told apart."""
+
+    abstained: bool = False
+    abstain_reason: str | None = None
+    candidates: list[IntentCandidateRecord] = Field(default_factory=list)
+    classifiers_configured: list[str] = Field(default_factory=list)
+    classifiers_run: list[str] = Field(default_factory=list)
+    """Configured, started and finished without error. A route that ran and then
+    failed its own evidence gate still counts as run."""
+
+    classifiers_abstained: list[str] = Field(default_factory=list)
+    """Ran but produced no candidate. Classifier names, not reasons: the name
+    already determines which gate was missed."""
+
+    degraded: bool = False
+    degraded_reason: str | None = None
+    model_called: bool = False
+    duration_ms: int = 0
+    iteration: int | None = None
+    """Which iteration the input arrived on, not which iteration the signal serves.
+    One classification serves every iteration until the next user input."""
+
+
 PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.SESSION_CREATED: SessionCreated,
     EventType.OPERATION_STARTED: OperationStarted,
@@ -734,6 +795,7 @@ PAYLOAD_TYPES: dict[EventType, type[Payload]] = {
     EventType.MCP_TOOLS_REGISTERED: McpToolsRegistered,
     EventType.SUBAGENT_TASK_STARTED: SubagentTaskStarted,
     EventType.SUBAGENT_TASK_FINISHED: SubagentTaskFinished,
+    EventType.INTENT_CLASSIFIED: IntentClassified,
 }
 
 

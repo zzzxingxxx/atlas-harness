@@ -276,3 +276,86 @@ def test_state_hash_changes_with_content(factory: IdFactory) -> None:
     shorter = events[:-1]
 
     assert replay(events).state_hash() != replay(shorter).state_hash()
+
+
+def intent_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "query": "where is the timeout handled",
+        "intent": "code_read",
+        "taxonomy_version": "1",
+        "confidence": 0.9,
+        "margin": 0.4,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_a_log_with_no_intent_event_folds_with_no_intent(factory: IdFactory) -> None:
+    """The v7-shaped case. `None` and not a placeholder label, because a session
+    nobody classified has to be distinguishable from one classified as unknown."""
+
+    assert replay(script(factory)).last_intent is None
+
+
+def test_an_intent_event_folds_into_the_projection(factory: IdFactory) -> None:
+    events = [*script(factory), event(factory, EventType.INTENT_CLASSIFIED, 11, intent_payload())]
+
+    last_intent = replay(events).last_intent
+
+    assert last_intent is not None
+    assert last_intent.intent == "code_read"
+    assert (last_intent.confidence, last_intent.margin) == (0.9, 0.4)
+    assert last_intent.abstained is False
+
+
+def test_the_newest_intent_wins_including_an_abstention(factory: IdFactory) -> None:
+    """An abstention is the current answer about what the user asked for. Keeping the
+    last confident label instead would show a stale intent as though it still applied."""
+
+    events = [
+        *script(factory),
+        event(factory, EventType.INTENT_CLASSIFIED, 11, intent_payload()),
+        event(
+            factory,
+            EventType.INTENT_CLASSIFIED,
+            12,
+            intent_payload(
+                query="change this",
+                intent="ambiguous",
+                confidence=0.61,
+                margin=0.04,
+                abstained=True,
+                abstain_reason="narrow_margin",
+            ),
+        ),
+    ]
+
+    last_intent = replay(events).last_intent
+
+    assert last_intent is not None
+    assert last_intent.intent == "ambiguous"
+    assert last_intent.abstained is True
+
+
+def test_state_hash_covers_the_folded_intent(factory: IdFactory) -> None:
+    """`last_intent` is derived from events, so it is inside the fingerprint: a
+    regression in how the signal folds has to fail a gate rather than hash the same."""
+
+    without = script(factory)
+    with_intent = [*without, event(factory, EventType.INTENT_CLASSIFIED, 11, intent_payload())]
+
+    assert replay(without).state_hash() != replay(with_intent).state_hash()
+
+
+def test_a_version_bump_alone_does_not_change_an_old_logs_hash(factory: IdFactory) -> None:
+    """What makes a v7 log fold to the same hash on a v8 build: `schema_version` records
+    which build did the folding, not anything the log said, so it is outside the
+    fingerprint. Asserted mechanically because the frozen samples in
+    `tests/replay/test_samples.py` can only catch it one release late."""
+
+    state = replay(script(factory))
+    before = state.state_hash()
+
+    state.schema_version += 1
+
+    assert state.state_hash() == before

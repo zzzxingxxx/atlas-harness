@@ -170,6 +170,40 @@ class SnapshotState(BaseModel):
     created_at_ms: int | None = None
 
 
+class IntentState(BaseModel):
+    """The most recent recorded intent signal, for display only.
+
+    Deliberately narrow: the label, how sure the fusion was, how far ahead of second
+    place it landed, and whether it gave up. Everything else about a classification
+    stays in the event, because this projection is read by ``atlas session show`` and
+    by humans, never by a decision path -- see the ``last_intent`` note in
+    ``docs/intent.md`` section 11 for why that boundary has to hold.
+    """
+
+    intent: str
+    confidence: float = 0.0
+    margin: float = 0.0
+    abstained: bool = False
+
+
+HASH_EXCLUDED_FIELDS: frozenset[str] = frozenset({"schema_version"})
+"""Projection fields left out of ``state_hash``.
+
+The rule is narrow on purpose: exclude what the log did not say, include
+everything it did. Leaving a field out means two states differing only in that
+field fingerprint the same, so anything a reducer derives from events -- including
+``last_intent`` -- stays in, and a regression in how it folds fails a gate.
+
+``schema_version`` is the one field that qualifies. It is never read off an event:
+it defaults to ``CURRENT_SCHEMA_VERSION``, so it records which build did the
+folding rather than anything about the data. Including it made the fingerprint of
+an untouched v1 log change on every version bump, which inverts the guarantee the
+frozen samples exist to prove -- an unchanged log read by a newer build has to
+fold to an unchanged hash. The per-event ``schema_version`` is still asserted
+directly by the sample suite, and that is the copy that describes the log.
+"""
+
+
 class SessionState(BaseModel):
     session_id: str
     status: str = "created"
@@ -262,6 +296,12 @@ class SessionState(BaseModel):
     """Task id -> how it ended. A task id in ``subagent_task_ids`` with no entry here
     was dispatched and never came back, which is exactly the state a crash leaves."""
 
+    last_intent: IntentState | None = None
+    """The newest intent signal, or ``None`` on a log that carries none. Read for
+    display and by no decision path (``docs/intent.md`` section 11), but still
+    covered by ``state_hash``: it is derived from events, so a change in how it
+    folds is a replay difference and has to fail the gate."""
+
     @property
     def open_subagent_task_ids(self) -> list[str]:
         """Dispatched and never resolved. Non-empty means resources may still be held."""
@@ -347,9 +387,21 @@ class SessionState(BaseModel):
         return max(candidates, key=lambda record: record.last_seq)
 
     def state_hash(self) -> str:
-        """Stable fingerprint so two replays of one log can be compared."""
+        """Stable fingerprint so two replays of one log can be compared.
 
-        canonical = json.dumps(self.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
+        The fingerprint covers what the events said, not what read them:
+        ``HASH_EXCLUDED_FIELDS`` is dropped first, and the note there says why each
+        exclusion is safe. Without it the samples committed at earlier releases stop
+        being a baseline, because they would have to be recomputed on every release
+        that grows the projection or bumps the version -- and a baseline you rewrite
+        to make it pass measures the rewriting, not the compatibility.
+        """
+
+        canonical = json.dumps(
+            self.model_dump(mode="json", exclude=set(HASH_EXCLUDED_FIELDS)),
+            sort_keys=True,
+            ensure_ascii=False,
+        )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -554,6 +606,16 @@ class Reducer:
                 # visibly incomplete.
                 state.subagent_task_ids.append(task_id)
             state.subagent_outcomes[task_id] = str(payload.get("outcome") or "completed")
+        elif event.event_type is EventType.INTENT_CLASSIFIED:
+            # Newest wins, abstentions included. An abstention is the current answer
+            # about what the user asked for, and keeping the last confident label
+            # instead would show a stale intent as though it still applied.
+            state.last_intent = IntentState(
+                intent=str(payload["intent"]),
+                confidence=float(payload.get("confidence") or 0.0),
+                margin=float(payload.get("margin") or 0.0),
+                abstained=bool(payload.get("abstained") or False),
+            )
 
     def _apply_operation_event(
         self, operation: OperationState, event: Event, payload: dict[str, Any]

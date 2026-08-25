@@ -1,48 +1,59 @@
 {
-  "current_schema_version": 7,
+  "current_schema_version": 8,
   "note": "Frozen. Regenerating these hashes instead of fixing the code would delete the backward-compatibility guarantee they exist to prove.",
+  "rebaselined": {
+    "at_schema_version": 8,
+    "why": "state_hash() used to cover SessionState.schema_version, which records the build that did the folding rather than anything the log said, so every version bump changed the fingerprint of untouched logs and the baseline had to be rewritten to pass -- measuring the rewriting, not the compatibility. HASH_EXCLUDED_FIELDS now drops that one field. Every hash below was recomputed once, here. Before the change each v7-era hash was reproduced exactly by pinning schema_version to 7, which is what proved no log is read differently.",
+    "expected_from_now_on": "a schema bump alone must leave every hash below untouched"
+  },
   "sessions": {
     "ses_release_demo": {
       "events": 23,
       "last_seq": 23,
       "schema_version": 7,
-      "state_hash": "6e23e76b824b093d71e0da41c1bd42a620d0b17fdb853a146f5e6119b5dfbdbf"
+      "state_hash": "60865d05bb0ce9d478862ae072b30a89f3d8ebefa2d551401d73bc9e67e9764f"
     },
     "ses_schema_v1": {
       "events": 5,
       "last_seq": 5,
       "schema_version": 1,
-      "state_hash": "beb74f4bc4669eacc84bc79f1b42bfa57b670e564d4cda0bfa30475feb0a1612"
+      "state_hash": "fbd7b0dfb2ca1f3943d47b6e57718809983ba5cff782deb2e7fbb97c30a5ecdb"
     },
     "ses_schema_v2": {
       "events": 5,
       "last_seq": 5,
       "schema_version": 2,
-      "state_hash": "eadafc49f7eae3f3b0b12de055da6384eba5c710dad578afbada37872d6aa2d7"
+      "state_hash": "253cf914bf1fbb06d232e6e42a18cbff5ca919e21c1e6a190551f101147eaf30"
     },
     "ses_schema_v3": {
       "events": 6,
       "last_seq": 6,
       "schema_version": 3,
-      "state_hash": "c7fb6ae27cbe7da534f855092e9faa82cb713aa7c06d5de62c1c443bd3ff41ea"
+      "state_hash": "4acfb17b715b2e2b1252100cdc7d630cec8612fa9d8f74fc2dc879b26e2923ae"
     },
     "ses_schema_v4": {
       "events": 5,
       "last_seq": 5,
       "schema_version": 4,
-      "state_hash": "b30a4551bd8c048f0420cd0e65c15ef0a6a25a99c9aa974bf950f4de732bd434"
+      "state_hash": "46eba82a22f5e94a92d9e14a29dd1e1a70f6603863ab152cb20c11d7d593476c"
     },
     "ses_schema_v5": {
       "events": 6,
       "last_seq": 6,
       "schema_version": 5,
-      "state_hash": "74ed2caf790ac6448c64c15466ea3b233048303a5ad94f17eaa07c285a4c1de5"
+      "state_hash": "10a56fe03a22bd5c12c34d3d34f5ad51789ca0f3564f3535b342ee56cf21b6da"
     },
     "ses_schema_v6": {
       "events": 7,
       "last_seq": 7,
       "schema_version": 6,
-      "state_hash": "c05dd0744db6d738a5e9421e86ed6eb93e87c9a7a25ba7cc15e3611fa8683f19"
+      "state_hash": "141d1051c1c50c1fe9b18e64be38f5c63300f9d239dd9ff09f9585819e68ac22"
+    },
+    "ses_schema_v8": {
+      "events": 5,
+      "last_seq": 5,
+      "schema_version": 8,
+      "state_hash": "d766370676d555f3a63572c0cca5f23a3b2f23d6aa93c7d014c25398a399c21f"
     }
   }
 }

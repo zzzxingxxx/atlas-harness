@@ -4,6 +4,26 @@
 
 事件 schema 的策略是**只进不改**：新版本可以新增事件类型和带默认值的字段，不可以重定义或移除已有的。所以任何受支持版本写下的日志在今天的构建上原样可读，`SUPPORTED_SCHEMA_VERSIONS` 只增不减。这条承诺由 `src/atlas_harness/events/compat.py` 声明、由 `samples/` 里每个版本一份的冻结日志证明。
 
+## 未发布 — 意图识别的数据合同（M10 第一步）
+
+Schema 版本 8（新增 `intent_classified`）。这一步只动数据合同，不含任何分类器——`docs/intent.md` 第 9 节把 M10 拆成四步，正是为了让「加事件类型」这件不可撤回的事尽早被样例日志和兼容性检查覆盖，且与分类逻辑对不对无关。
+
+### 新增
+
+- `intent_classified` 事件：一次意图分类的完整记录。弃权也写，因为「taxonomy 覆盖不到用户实际在问什么」只能从弃权率上看出来，一份只留下自信答案的日志回答不了这个问题。`classifiers_abstained` 与 `degraded` 分开：一路跑完了但证据不够，不等于一路没跑起来。
+- `SessionState.last_intent`：最新一条意图信号的投影，只给 `atlas session show` 和人看，不给任何决策路径读。新的胜出，弃权也算——弃权是当前答案，留着上一个自信标签等于把过期结论当成还生效的。
+- `samples/sessions/ses_schema_v8/`：v8 冻结日志，含一条自信分类和一条弃权分类。
+
+### 修复
+
+- `state_hash()` 此前把 `schema_version` 算进指纹，而这个字段取自 `CURRENT_SCHEMA_VERSION`、记录的是谁折的而不是日志说了什么。后果是每次 bump 版本都会让所有未改动的旧日志换一个哈希，于是 `samples/expected.json` 只能跟着改写——而一份为了让测试通过而重算的基线，度量的是重算本身，不是兼容性。现在它被排除在指纹之外，`HASH_EXCLUDED_FIELDS` 是唯一的例外名单，规则是「日志没说的排除，说了的都算进来」。
+
+  **`expected.json` 里八个哈希因此一次性重算。**这是这个文件唯一一次被允许重写，代价换来的是它此后真正冻结：v9、v10 再也不会碰它。旧哈希不可能在新规则下复现，所以重算无法回避；能选的只是把基线冻在哪条规则上。`last_intent` 留在指纹内，因为它是从事件折出来的——折错了必须挂门禁。
+
+### 测试
+
+新增 8 项：`tests/unit/test_reducer.py` 5 项（含 `test_a_version_bump_alone_does_not_change_an_old_logs_hash`，把上面那条修复钉在机械断言上，而不是等冻结样例在下一个版本才发现），`tests/replay/test_samples.py` 因 v8 样例加入而多出 3 项。门禁 1370 passed / 3 skipped，三项 skip 仍是环境性的。
+
 ## 0.9.0 — 稳定性、安全和发布（M9）
 
 Schema 版本 7，未变。M9 不新增事件类型，这是刻意的：一个稳定性里程碑如果自己改了数据合同，它交付的正是它要消除的风险。
