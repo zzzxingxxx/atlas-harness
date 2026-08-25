@@ -332,10 +332,7 @@ def test_a_budget_too_small_for_the_fixed_slot_raises() -> None:
 def test_tool_declarations_count_against_the_budget() -> None:
     """Leaving them out would make the budget optimistic exactly where it hurts."""
 
-    declaration = {
-        "type": "function",
-        "function": {"name": "read_file", "description": "d" * 400, "parameters": {}},
-    }
+    declaration = {"name": "read_file", "description": "d" * 400, "input_schema": {}}
     without = ContextCompiler(budget=ContextBudget(limit_tokens=4_000))
     with_tools = ContextCompiler(budget=ContextBudget(limit_tokens=4_000), tools=[declaration])
 

@@ -87,7 +87,7 @@ async def test_exhausted_script_raises_because_it_signals_a_test_bug() -> None:
 
 async def test_every_request_is_recorded_for_assertions() -> None:
     adapter = FakeAdapter([text_turn("ok"), text_turn("ok")])
-    tools: tuple[dict[str, object], ...] = ({"type": "function", "name": "read_file"},)
+    tools: tuple[dict[str, object], ...] = ({"name": "read_file", "input_schema": {}},)
 
     await _drain(adapter, _request("first"))
     await _drain(adapter, _request("second", tools=tools))

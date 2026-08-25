@@ -2,7 +2,9 @@
 
 This module never imports the tool executor: a model produces *requests* to
 call tools, and the agent layer decides whether any of them may run. Tool
-declarations arrive as plain JSON schema dicts from ``ToolRegistry.describe``.
+declarations arrive as dialect-free ``{name, description, input_schema}`` dicts
+from ``atlas_harness.agent.tool_declarations``; each adapter renders them into
+its own wire format.
 """
 
 from __future__ import annotations
@@ -108,7 +110,7 @@ class ModelRequest(BaseModel):
     model: str
     messages: tuple[ModelMessage, ...]
     tools: tuple[dict[str, Any], ...] = ()
-    """Tool declarations as produced by ``ToolRegistry.describe``."""
+    """Declarations in the neutral ``{name, description, input_schema}`` shape."""
 
     max_output_tokens: int | None = Field(default=None, gt=0)
     temperature: float | None = Field(default=None, ge=0, le=2)

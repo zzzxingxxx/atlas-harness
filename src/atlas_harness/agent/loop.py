@@ -87,21 +87,24 @@ FOLLOW_UP_PREFIX = "[follow-up] "
 
 
 def tool_declarations(registry: ToolRegistry) -> tuple[dict[str, Any], ...]:
-    """Translate registry manifests into the function-calling shape.
+    """Translate registry manifests into provider-neutral tool declarations.
 
-    The registry describes tools for operators: risk, scopes, timeouts. A model
-    needs only name, purpose and arguments, so the operational fields are left
-    out rather than passed along as prompt noise.
+    Two filters apply. The registry describes tools for operators — risk, scopes,
+    timeouts — and a model needs only name, purpose and arguments, so the
+    operational fields are left out rather than passed along as prompt noise.
+
+    And the shape stays dialect-free. OpenAI nests this under ``{"type":
+    "function", "function": {...}}`` and renames the schema to ``parameters``;
+    Anthropic takes ``input_schema`` at the top level. Neither spelling belongs
+    here: each adapter owns its own wire format, so adding a provider does not
+    mean first teaching it to read another provider's dialect.
     """
 
     return tuple(
         {
-            "type": "function",
-            "function": {
-                "name": manifest.name,
-                "description": manifest.description,
-                "parameters": manifest.input_schema,
-            },
+            "name": manifest.name,
+            "description": manifest.description,
+            "input_schema": manifest.input_schema,
         }
         for manifest in registry.manifests()
     )

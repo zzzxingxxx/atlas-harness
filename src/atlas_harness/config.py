@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     model_api_key: SecretStr | None = None
     """Never logged, never written to an event; providers read it at call time."""
 
+    model_anthropic_version: str = "2023-06-01"
+    """Sent as ``anthropic-version`` by the native Messages adapter, ignored by the
+    others. Configurable but pinned by default: the header selects a wire contract,
+    so following a newer one should be a deliberate act."""
+
     model_max_retries: int = Field(default=2, ge=0, le=8)
     model_max_output_tokens: int = Field(default=4_096, gt=0)
     max_iterations: int = Field(default=12, gt=0)

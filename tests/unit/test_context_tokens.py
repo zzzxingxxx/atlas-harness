@@ -54,7 +54,7 @@ def test_the_estimator_counts_tool_declarations() -> None:
 
     counter = EstimatingCounter()
     messages = (ModelMessage.user("hi"),)
-    tools = ({"type": "function", "function": {"name": "read_file", "description": "x" * 200}},)
+    tools = ({"name": "read_file", "description": "x" * 200, "input_schema": {}},)
 
     assert counter.count(TokenInput(messages=messages, tools=tools)) > counter.count(
         TokenInput(messages=messages)

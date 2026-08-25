@@ -13,6 +13,10 @@ Schema 版本 8（新增 `intent_classified`）。这一步只动数据合同，
 - `intent_classified` 事件：一次意图分类的完整记录。弃权也写，因为「taxonomy 覆盖不到用户实际在问什么」只能从弃权率上看出来，一份只留下自信答案的日志回答不了这个问题。`classifiers_abstained` 与 `degraded` 分开：一路跑完了但证据不够，不等于一路没跑起来。
 - `SessionState.last_intent`：最新一条意图信号的投影，只给 `atlas session show` 和人看，不给任何决策路径读。新的胜出，弃权也算——弃权是当前答案，留着上一个自信标签等于把过期结论当成还生效的。
 - `samples/sessions/ses_schema_v8/`：v8 冻结日志，含一条自信分类和一条弃权分类。
+- `src/atlas_harness/model/providers/anthropic_messages.py`：原生 Anthropic Messages 适配器（`POST /messages`），`ATLAS_MODEL_PROVIDER=anthropic` 或 `anthropic_messages` 启用。方言差异不止 URL：`x-api-key` 加必需的 `anthropic-version`、system 提示是顶层参数而不是消息、`max_tokens` 必填、具名 SSE 事件、工具参数以 `input_json_delta` 的文本碎片到达。最容易被漏掉的一条是**连续的工具结果必须合并进同一个 user 轮次**——角色必须交替，而一批并行工具调用会产出多条 `tool` 消息，逐条发出去会被 API 拒绝。schema 版本不变：加 provider 不动数据合同。
+- `src/atlas_harness/model/providers/_http.py`：两个 HTTP adapter 共享的故障分类、退避和 `stream_with_retry`。抽出来的理由是「**只在第一个事件送达调用方之前重试**」这条规则不能有两份实现——一旦某个 adapter 把它写错，重复的文本会被当成模型真的说了两遍，而这种缺陷在单 adapter 的测试里看不出来。`RETRYABLE_STATUS_CODES` 补了 529（不在任何 RFC 里，是 Anthropic 的 `overloaded_error`，也是这个方言最常见的瞬时故障）。
+- `ATLAS_MODEL_ANTHROPIC_VERSION`（默认 `2023-06-01`）：这个 header 选的是一份线格式合同，不是版本号装饰，所以跟随新版必须是显式动作。
+- `catalog.py` 新增四个 Anthropic 模型的能力条目（`claude-sonnet-4-5`、`claude-opus-4-1`、`claude-haiku-4-5`、`claude-3-5-haiku-latest`）。
 
 ### 修复
 
@@ -20,9 +24,11 @@ Schema 版本 8（新增 `intent_classified`）。这一步只动数据合同，
 
   **`expected.json` 里八个哈希因此一次性重算。**这是这个文件唯一一次被允许重写，代价换来的是它此后真正冻结：v9、v10 再也不会碰它。旧哈希不可能在新规则下复现，所以重算无法回避；能选的只是把基线冻在哪条规则上。`last_intent` 留在指纹内，因为它是从事件折出来的——折错了必须挂门禁。
 
+- `agent/loop.py:tool_declarations()` 此前直接产出 OpenAI 的 `{"type": "function", "function": {...}}`，与 `model/protocol.py` 自己写下的合同矛盾。这是分层缺陷而不是风格问题：它等于要求每个新方言的 adapter 先学会读 OpenAI 的方言，再翻译成自己的。现在它产出与方言无关的 `{name, description, input_schema}`，渲染成各自的线格式是 adapter 的事。改动面在落地前先量过：8 处形状断言，无生产行为变化。
+
 ### 测试
 
-新增 8 项：`tests/unit/test_reducer.py` 5 项（含 `test_a_version_bump_alone_does_not_change_an_old_logs_hash`，把上面那条修复钉在机械断言上，而不是等冻结样例在下一个版本才发现），`tests/replay/test_samples.py` 因 v8 样例加入而多出 3 项。门禁 1370 passed / 3 skipped，三项 skip 仍是环境性的。
+新增 42 项：`tests/unit/test_reducer.py` 5 项（含 `test_a_version_bump_alone_does_not_change_an_old_logs_hash`，把上面那条修复钉在机械断言上，而不是等冻结样例在下一个版本才发现），`tests/replay/test_samples.py` 因 v8 样例加入而多出 3 项，`tests/unit/test_model_anthropic_provider.py` 34 项（全部走注入的 `MockTransport`，不碰网络：请求形状、流解析、六种 stop reason、跨两帧的 usage 累计，以及五类故障各自的报告方式），另有两项断言把方言归属钉住——`test_declarations_are_free_of_any_provider_dialect` 和 `test_neutral_declarations_are_wrapped_in_the_function_envelope`。门禁 1402 passed / 3 skipped，三项 skip 仍是环境性的。
 
 ## 0.9.0 — 稳定性、安全和发布（M9）
 

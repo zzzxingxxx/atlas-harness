@@ -94,9 +94,22 @@ def test_declarations_carry_only_what_a_model_needs() -> None:
 
     assert declarations
     for declaration in declarations:
-        assert declaration["type"] == "function"
-        assert set(declaration["function"]) == {"name", "description", "parameters"}
-        assert declaration["function"]["parameters"]["type"] == "object"
+        assert set(declaration) == {"name", "description", "input_schema"}
+        assert declaration["input_schema"]["type"] == "object"
+
+
+def test_declarations_are_free_of_any_provider_dialect() -> None:
+    """The shape must be neutral, not OpenAI's.
+
+    Pinned mechanically because the failure is silent in the other direction: an
+    adapter handed a pre-wrapped declaration would forward a nested ``function``
+    object that the Anthropic API rejects, and only a live call would show it.
+    """
+
+    for declaration in tool_declarations(default_registry()):
+        assert "function" not in declaration
+        assert "parameters" not in declaration
+        assert declaration.get("type") != "function"
 
 
 def test_declarations_omit_operator_facing_fields() -> None:
@@ -111,12 +124,11 @@ def test_declarations_omit_operator_facing_fields() -> None:
 
     for declaration in tool_declarations(default_registry()):
         assert not operator_only & set(declaration)
-        assert not operator_only & set(declaration["function"])
 
 
 def test_declarations_cover_every_registered_tool() -> None:
     registry = default_registry()
-    names = {d["function"]["name"] for d in tool_declarations(registry)}
+    names = {d["name"] for d in tool_declarations(registry)}
 
     assert names == {manifest.name for manifest in registry.manifests()}
 
@@ -194,7 +206,7 @@ async def test_every_request_carries_the_tool_declarations(
 
     assert adapter.calls == 2
     for request in adapter.requests:
-        assert {d["function"]["name"] for d in request.tools} >= {"read_file"}
+        assert {d["name"] for d in request.tools} >= {"read_file"}
 
 
 async def test_the_whole_round_trip_is_in_the_log(

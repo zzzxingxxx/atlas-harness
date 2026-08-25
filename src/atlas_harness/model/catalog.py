@@ -55,6 +55,33 @@ _CAPABILITIES: dict[str, ModelCapabilities] = {
             max_output_tokens=8_192,
         ),
         ModelCapabilities(
+            provider="anthropic",
+            model="claude-sonnet-4-5",
+            supports_thinking=True,
+            max_context_tokens=200_000,
+            max_output_tokens=64_000,
+        ),
+        ModelCapabilities(
+            provider="anthropic",
+            model="claude-opus-4-1",
+            supports_thinking=True,
+            max_context_tokens=200_000,
+            max_output_tokens=32_000,
+        ),
+        ModelCapabilities(
+            provider="anthropic",
+            model="claude-haiku-4-5",
+            supports_thinking=True,
+            max_context_tokens=200_000,
+            max_output_tokens=64_000,
+        ),
+        ModelCapabilities(
+            provider="anthropic",
+            model="claude-3-5-haiku-latest",
+            max_context_tokens=200_000,
+            max_output_tokens=8_192,
+        ),
+        ModelCapabilities(
             provider="fake",
             model="fake-model",
             supports_thinking=True,
@@ -143,12 +170,15 @@ def _register_builtin_providers() -> None:
     provider modules themselves without a circular import.
     """
 
+    from atlas_harness.model.providers.anthropic_messages import AnthropicMessagesAdapter
     from atlas_harness.model.providers.fake import FakeAdapter
     from atlas_harness.model.providers.openai_compatible import OpenAICompatibleAdapter
 
     register_provider("fake", FakeAdapter.from_settings)
     for name in ("openai", "deepseek", "openai_compatible"):
         register_provider(name, OpenAICompatibleAdapter.from_settings)
+    for name in ("anthropic", "anthropic_messages"):
+        register_provider(name, AnthropicMessagesAdapter.from_settings)
 
 
 _register_builtin_providers()

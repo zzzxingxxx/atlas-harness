@@ -377,7 +377,7 @@ async def test_request_body_carries_messages_tools_and_limits() -> None:
         return httpx.Response(200, content=_sse(_text_chunk("ok"), _finish_chunk()))
 
     tools: tuple[dict[str, object], ...] = (
-        {"type": "function", "function": {"name": "read_file", "parameters": {}}},
+        {"name": "read_file", "description": "read it", "input_schema": {"type": "object"}},
     )
     request = ModelRequest(
         model="gpt-4o-mini",
@@ -395,8 +395,39 @@ async def test_request_body_carries_messages_tools_and_limits() -> None:
     assert captured["temperature"] == 0.2
     assert captured["stop"] == ["STOP"]
     assert captured["tool_choice"] == "auto"
-    assert captured["tools"] == list(tools)
     assert [message["role"] for message in captured["messages"]] == ["system", "user"]  # type: ignore[union-attr]
+
+
+async def test_neutral_declarations_are_wrapped_in_the_function_envelope() -> None:
+    """The adapter owns the dialect, so the nesting and the ``parameters`` rename
+    happen here rather than in the agent loop that builds the declarations."""
+
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, content=_sse(_text_chunk("ok"), _finish_chunk()))
+
+    request = ModelRequest(
+        model="gpt-4o-mini",
+        messages=(ModelMessage.user("hi"),),
+        tools=(
+            {"name": "read_file", "description": "read it", "input_schema": {"type": "object"}},
+        ),
+    )
+
+    await _drain(_adapter(handler), request)
+
+    assert captured["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read it",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
 
 
 async def test_tool_result_turns_are_sent_back_in_wire_format() -> None:

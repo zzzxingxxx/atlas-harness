@@ -2,7 +2,7 @@
 
 AtlasHarness 是一个模型无关、工具可插拔、会话可恢复、能力可演化的 Agent Runtime。
 
-当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩、M6 Memory、Skill 和来源追踪、M7 Pending Window 与受控自进化，M8 MCP、子 Agent、HTTP 和观测台接口，以及 M9 稳定性、安全和发布：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账，以及 Pending Window 反馈收集、候选 Skill 抽取与证据绑定、add/merge/reject 决策、固定 benchmark 与七项指标评测、champion 晋升和回滚，以及 MCP 服务器连接与工具翻译、每服务器的 scope/超时/并发/凭证隔离、子 Agent 任务合同与隔离执行、FastAPI 的 Session/Run/Abort/Resume/Compact/Events/Trace/Audit/Export/Skills 路由，和 trace.jsonl、audit.jsonl、metrics.json、replay-report.json 四个观测台产物，以及 M9 冻结的事件 schema 兼容性策略、verify/reindex/backup/backup-check/restore/release-check 六条运维命令、逐版本冻结的可回放样例日志、十项发布检查与八项风险的监控/暂停/回滚动作，和运行、故障恢复与安全审查三份手册。[Python 开发计划](./agent-harness-python-development-plan.md) 的 M0 到 M9 已全部实现。
+当前实现覆盖 M0/M1 基础设施、M2 安全工具执行、M3 模型适配层与 Agent Loop、M4 Session / Lane / 快照与崩溃恢复、M5 上下文编译器与结构化压缩、M6 Memory、Skill 和来源追踪、M7 Pending Window 与受控自进化，M8 MCP、子 Agent、HTTP 和观测台接口，以及 M9 稳定性、安全和发布：包括 append-only 事件日志、SQLite 事件索引、纯函数 Reducer、事件订阅、Tool Registry、五个内置工具、路径/命令/网络策略、审批、超时、取消、输出截断和统一脱敏，统一流式协议、OpenAI 兼容与原生 Anthropic Messages 两个适配器、可脚本化的 fake 适配器、三条消息队列和一次完整的「模型 -> 工具 -> 结果 -> 模型」闭环，周期性快照、显式 session 恢复、`suspended`/`resume`/`abort` 与人工确认、Lane 与分支导航，以及五槽位上下文编译、Token 计数接口、70%/85%/95% 阈值策略、九字段结构化摘要和大工具输出的 artifact 外置，以及四层 Memory、SQLite FTS5/BM25 检索、Skill YAML/JSON metadata 与版本状态机、权限过滤和逐次注入记账，以及 Pending Window 反馈收集、候选 Skill 抽取与证据绑定、add/merge/reject 决策、固定 benchmark 与七项指标评测、champion 晋升和回滚，以及 MCP 服务器连接与工具翻译、每服务器的 scope/超时/并发/凭证隔离、子 Agent 任务合同与隔离执行、FastAPI 的 Session/Run/Abort/Resume/Compact/Events/Trace/Audit/Export/Skills 路由，和 trace.jsonl、audit.jsonl、metrics.json、replay-report.json 四个观测台产物，以及 M9 冻结的事件 schema 兼容性策略、verify/reindex/backup/backup-check/restore/release-check 六条运维命令、逐版本冻结的可回放样例日志、十项发布检查与八项风险的监控/暂停/回滚动作，和运行、故障恢复与安全审查三份手册。[Python 开发计划](./agent-harness-python-development-plan.md) 的 M0 到 M9 已全部实现。
 
 ## 环境
 
@@ -144,7 +144,19 @@ model_requested  model_stream_completed  assistant_message
 operation_finished
 ```
 
-真实模型走 OpenAI 兼容适配器，端点和密钥只来自运营配置（`ATLAS_MODEL_BASE_URL`、`ATLAS_MODEL_API_KEY`），密钥以 `SecretStr` 持有、只在发起调用时读取，不会进入任何事件、日志或轨迹。
+真实模型有两个方言各自的适配器，端点和密钥都只来自运营配置（`ATLAS_MODEL_BASE_URL`、`ATLAS_MODEL_API_KEY`），密钥以 `SecretStr` 持有、只在发起调用时读取，不会进入任何事件、日志或轨迹。
+
+| `ATLAS_MODEL_PROVIDER` | 方言 | 模块 |
+| --- | --- | --- |
+| `openai` / `deepseek` / `openai_compatible` | OpenAI `POST /chat/completions` | `model/providers/openai_compatible.py` |
+| `anthropic` / `anthropic_messages` | 原生 Anthropic `POST /messages` | `model/providers/anthropic_messages.py` |
+| `fake` | 无网络，按脚本回放 | `model/providers/fake.py` |
+
+两者共享的部分被抽到 `model/providers/_http.py`：故障分类、退避和「**只在第一个事件送达调用方之前重试**」这条规则。这条规则不能有两份实现——一旦某个 adapter 把它写错，重复的文本会被当成模型真的说了两遍。
+
+方言的差别不止 URL，Anthropic 一侧改变代码结构的有五处：`x-api-key` 加必需的 `anthropic-version` 而不是 Bearer；system 提示不是消息而是顶层参数；只有 user/assistant 两个角色且必须交替，所以连续的工具结果要**合并进同一个 user 轮次**（一批并行工具调用会产出多条 `tool`消息，逐条发出去会被 API 拒绝）；`max_tokens` 是必填；流是具名 SSE 事件，工具参数以 `input_json_delta` 的文本碎片到达。
+
+工具声明因此改成了与方言无关的 `{name, description, input_schema}`——`agent/loop.py:tool_declarations` 此前直接产出 OpenAI 的 `{"type": "function", "function": {...}}`，等于让每个新 adapter 先学会读另一个 provider 的方言。渲染成各自的线格式现在是 adapter 自己的事。
 
 ## Session、快照与崩溃恢复（M4）
 
@@ -479,7 +491,7 @@ GET  /skills                       GET  /tools
 - [安全审查记录](docs/security-review.md)：路径、命令、Prompt Injection、Skill Poisoning、MCP 越权、敏感信息落盘和事件完整性七个专项，每项列出在哪里判定、用什么证明，**以及已知的边界**。最后一栏是关键——一份只列「已覆盖」的安全记录会让读它的人高估防护范围，而高估比空白更危险。
 - [变更记录](CHANGELOG.md)：版本号形式为 `0.M.0`，每个版本一节 schema 说明。
 
-安全记录的结论是明确的：**内部试用可以进行，不适合处理生产凭证或暴露到不受信任的网络。** HTTP 传输层没有认证（默认绑 loopback）、工具执行没有沙箱、没做过渗透测试、OpenAI 兼容 adapter 未对真实 endpoint 发过请求、依赖供应链未审计——这些都是接受而非缓解，写在第 8 节里以免被读成已覆盖。
+安全记录的结论是明确的：**内部试用可以进行，不适合处理生产凭证或暴露到不受信任的网络。** HTTP 传输层没有认证（默认绑 loopback）、工具执行没有沙箱、没做过渗透测试、真实 provider 的行为不在自动化门禁内（门禁里的 provider 覆盖全部来自注入的 transport，证明 adapter 会按方言文档解析，不证明某个 endpoint 真的说这套方言；换 provider 或换网关之后请手工跑一次 `atlas model-check`）、依赖供应链未审计——这些都是接受而非缓解，写在第 8 节里以免被读成已覆盖。
 
 ### 规模检查在里程碑边界跑，不进每次 PR 的门禁
 

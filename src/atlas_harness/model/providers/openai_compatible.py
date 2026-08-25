@@ -5,14 +5,11 @@ This covers OpenAI itself plus the many gateways that copy its wire format
 streaming shape is implemented, because the whole loop is built on incremental
 events.
 
-Two rules shape the error handling:
-
-* :meth:`OpenAICompatibleAdapter.stream` never raises for a provider fault. Every
-  failure becomes a :class:`ProviderErrorEvent` so the agent loop has exactly one
-  code path for "the model did not answer".
-* A retry only happens *before* the first event reaches the caller. Once a text
-  delta has been handed downstream, replaying the request would duplicate that
-  text, so a mid-stream break is reported instead of retried.
+Error handling and retries live in :mod:`atlas_harness.model.providers._http`,
+shared with every other HTTP adapter: :meth:`OpenAICompatibleAdapter.stream`
+never raises for a provider fault, and a retry only happens before the first
+event reaches the caller. What stays here is the dialect — the request body, the
+SSE chunk shape, and the ``finish_reason`` vocabulary.
 
 Network note: the endpoint comes from operator configuration
 (``ATLAS_MODEL_BASE_URL``), never from model output, so it is trusted egress and
@@ -23,7 +20,6 @@ an event.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from types import TracebackType
@@ -50,18 +46,19 @@ from atlas_harness.model.protocol import (
     ToolCallDelta,
     ToolCallStarted,
 )
+from atlas_harness.model.providers._http import (
+    RETRYABLE_STATUS_CODES,
+    ProviderFault,
+    clip,
+    default_sleep,
+    fault_from_response,
+    stream_with_retry,
+)
 from atlas_harness.model.tokens import count_tokens_estimate
 
+__all__ = ["DEFAULT_BASE_URL", "RETRYABLE_STATUS_CODES", "OpenAICompatibleAdapter"]
+
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-
-RETRYABLE_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
-"""Statuses worth a second attempt: overload, throttling, transient gateways."""
-
-_MAX_ERROR_CHARS = 400
-"""Provider error bodies can be long HTML pages; only the head is useful."""
-
-_BACKOFF_BASE_SECONDS = 0.5
-_BACKOFF_CAP_SECONDS = 8.0
 
 _FINISH_REASONS: Mapping[str, StopReason] = {
     "stop": StopReason.END_TURN,
@@ -73,29 +70,22 @@ _FINISH_REASONS: Mapping[str, StopReason] = {
 }
 
 
-class _ProviderFault(Exception):
-    """Internal signal carrying everything one failure needs to report."""
+def _tool_declaration_payload(tool: Mapping[str, Any]) -> dict[str, Any]:
+    """Wrap a neutral declaration in the OpenAI function-calling envelope.
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        error_code: str,
-        retryable: bool,
-        status_code: int | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.message = message
-        self.error_code = error_code
-        self.retryable = retryable
-        self.status_code = status_code
+    ``ModelRequest.tools`` carries the dialect-free ``{name, description,
+    input_schema}`` shape, so the OpenAI-specific nesting and the ``parameters``
+    rename happen here rather than upstream in the agent loop.
+    """
 
-
-def _clip(text: str) -> str:
-    collapsed = " ".join(text.split())
-    if len(collapsed) <= _MAX_ERROR_CHARS:
-        return collapsed
-    return f"{collapsed[:_MAX_ERROR_CHARS]}... (truncated)"
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.get("name", ""),
+            "description": tool.get("description", ""),
+            "parameters": tool.get("input_schema", {"type": "object", "properties": {}}),
+        },
+    }
 
 
 def _tool_calls_payload(calls: Sequence[ModelToolCall]) -> list[dict[str, Any]]:
@@ -177,7 +167,7 @@ class OpenAICompatibleAdapter:
         self._include_usage = include_usage
         self._default_headers = dict(default_headers or {})
         self._transport = transport
-        self._sleep = sleep or _default_sleep
+        self._sleep = sleep or default_sleep
         self._client: httpx.AsyncClient | None = None
 
     @classmethod
@@ -235,29 +225,12 @@ class OpenAICompatibleAdapter:
             return
 
         body = self._request_body(request)
-        attempt = 1
-        while True:
-            emitted = False
-            try:
-                async for event in self._attempt(body):
-                    emitted = True
-                    yield event
-                return
-            except _ProviderFault as fault:
-                exhausted = attempt > self._max_retries
-                if emitted or not fault.retryable or exhausted:
-                    yield ProviderErrorEvent(
-                        message=fault.message,
-                        error_code=fault.error_code,
-                        status_code=fault.status_code,
-                        # Partial output already went downstream, so replaying
-                        # would duplicate it: report rather than retry.
-                        retryable=fault.retryable and not emitted,
-                        attempt=attempt,
-                    )
-                    return
-                await self._sleep(_backoff_seconds(attempt))
-                attempt += 1
+        async for event in stream_with_retry(
+            lambda: self._attempt(body),
+            max_retries=self._max_retries,
+            sleep=self._sleep,
+        ):
+            yield event
 
     def _request_body(self, request: ModelRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -273,7 +246,7 @@ class OpenAICompatibleAdapter:
         if request.stop:
             body["stop"] = list(request.stop)
         if request.tools:
-            body["tools"] = list(request.tools)
+            body["tools"] = [_tool_declaration_payload(tool) for tool in request.tools]
             body["tool_choice"] = "auto"
         if self._include_usage:
             body["stream_options"] = {"include_usage": True}
@@ -299,7 +272,7 @@ class OpenAICompatibleAdapter:
         return self._client
 
     async def _attempt(self, body: Mapping[str, Any]) -> AsyncIterator[ModelEvent]:
-        """One HTTP call. Raises :class:`_ProviderFault`; never yields an error."""
+        """One HTTP call. Raises :class:`ProviderFault`; never yields an error."""
 
         client = self._ensure_client()
         state = _StreamState()
@@ -308,59 +281,30 @@ class OpenAICompatibleAdapter:
                 "POST", "/chat/completions", json=dict(body), headers=self._headers()
             ) as response:
                 if response.status_code >= 400:
-                    raise await _fault_from_response(response)
+                    raise await fault_from_response(response)
                 async for line in response.aiter_lines():
                     for event in state.consume(line):
                         yield event
         except httpx.TimeoutException as exc:
-            raise _ProviderFault(
+            raise ProviderFault(
                 f"model request timed out after {self._timeout_seconds}s",
                 error_code="provider_timeout",
                 retryable=True,
             ) from exc
         except httpx.HTTPError as exc:
-            raise _ProviderFault(
-                f"model request failed: {_clip(str(exc))}",
+            raise ProviderFault(
+                f"model request failed: {clip(str(exc))}",
                 error_code="provider_transport_error",
                 retryable=True,
             ) from exc
 
         if not state.completed:
-            raise _ProviderFault(
+            raise ProviderFault(
                 "model stream ended without a completion marker",
                 error_code="provider_incomplete_stream",
                 retryable=True,
             )
         yield state.completion()
-
-
-async def _fault_from_response(response: httpx.Response) -> _ProviderFault:
-    """Build a fault from an error response, reading the body for context."""
-
-    raw = await response.aread()
-    detail = ""
-    try:
-        decoded = json.loads(raw)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        detail = _clip(raw.decode("utf-8", errors="replace"))
-    else:
-        if isinstance(decoded, Mapping):
-            error = decoded.get("error")
-            if isinstance(error, Mapping):
-                detail = _clip(str(error.get("message", "")))
-            elif isinstance(error, str):
-                detail = _clip(error)
-        if not detail:
-            detail = _clip(json.dumps(decoded)[:_MAX_ERROR_CHARS])
-
-    status = response.status_code
-    suffix = f": {detail}" if detail else ""
-    return _ProviderFault(
-        f"provider returned HTTP {status}{suffix}",
-        error_code=f"provider_http_{status}",
-        retryable=status in RETRYABLE_STATUS_CODES,
-        status_code=status,
-    )
 
 
 class _StreamState:
@@ -390,13 +334,13 @@ class _StreamState:
         try:
             chunk = json.loads(data)
         except json.JSONDecodeError as exc:
-            raise _ProviderFault(
+            raise ProviderFault(
                 f"provider sent a malformed stream chunk: {exc.msg}",
                 error_code="provider_bad_chunk",
                 retryable=False,
             ) from exc
         if not isinstance(chunk, Mapping):
-            raise _ProviderFault(
+            raise ProviderFault(
                 f"provider stream chunk is not an object, got {type(chunk).__name__}",
                 error_code="provider_bad_chunk",
                 retryable=False,
@@ -412,8 +356,8 @@ class _StreamState:
         if isinstance(error, Mapping):
             # Some gateways report a mid-stream failure inside a data frame
             # rather than by breaking the connection.
-            raise _ProviderFault(
-                f"provider reported a stream error: {_clip(str(error.get('message', error)))}",
+            raise ProviderFault(
+                f"provider reported a stream error: {clip(str(error.get('message', error)))}",
                 error_code="provider_stream_error",
                 retryable=False,
             )
@@ -496,14 +440,3 @@ class _StreamState:
         if self._announced and stop_reason is StopReason.END_TURN:
             stop_reason = StopReason.TOOL_USE
         return MessageCompleted(stop_reason=stop_reason, usage=self._usage or TokenUsage())
-
-
-def _backoff_seconds(attempt: int) -> float:
-    """Exponential backoff, capped. Deterministic so tests can assert the waits."""
-
-    growth = float(2 ** (attempt - 1))
-    return min(_BACKOFF_BASE_SECONDS * growth, _BACKOFF_CAP_SECONDS)
-
-
-async def _default_sleep(seconds: float) -> None:
-    await asyncio.sleep(seconds)
